@@ -145,14 +145,33 @@ uv run dsp408 mqtt --broker 192.168.1.5 --topic-prefix audio/dsp408
 
 Each attached DSP-408 auto-registers as a separate **device** in Home
 Assistant (discovery topic `homeassistant/device/dsp408_<id>/config`,
-HA 2024.12+ device-based format). You'll see entities:
+HA 2024.12+ device-based format).
 
-* **Firmware identity** (sensor, diagnostic)
-* **Preset name** (text, read/write — rename the active preset from HA)
-* **Status byte** (sensor, diagnostic)
-* **State 0x13** / **Global 0x06** (diagnostic sensors, hex-dumped)
+**Entities exposed today** (one of each, per DSP-408):
 
-Plus a raw-protocol channel for custom automations:
+| Entity              | HA type | Direction | Notes                                      |
+|---------------------|---------|-----------|--------------------------------------------|
+| Firmware identity   | sensor  | read-only | e.g. `MYDW-AV1.06`; `diagnostic`           |
+| **Preset name**     | text    | **read/write** | rename the active preset (≤15 chars)  |
+| Status byte         | sensor  | read-only | numeric; `diagnostic`                      |
+| State 0x13          | sensor  | read-only | hex blob; `diagnostic`                     |
+| Global 0x06         | sensor  | read-only | hex blob; `diagnostic`                     |
+
+**Preset name is the only interactive control right now.** Master
+volume, per-channel mute / phase / delay, PEQ bands, HPF/LPF
+crossovers, and the 4×8 input→output matrix will light up once the
+`0x77NN` 296-byte layout is decoded live (tracked in the top-of-README
+status table). Add them in
+`dsp408/mqtt.py::DeviceWorker.build_discovery_payload()`.
+
+**Availability:** there's a per-device topic `dsp408/<id>/status` plus
+a bridge-level LWT on `dsp408/bridge/status`, combined with
+`avty_mode: all`. If the bridge process dies or the USB handle
+stops answering, *every* device's entities flip to "unavailable" in
+HA immediately.
+
+Plus a raw-protocol channel for custom automations (this is the real
+escape hatch until the high-level entities land):
 
 ```
 Topic                                  Payload
@@ -162,14 +181,9 @@ dsp408/<id>/raw/write                  {"cmd":"0x1f07","cat":"0x04","data_hex":"
 dsp408/<id>/raw/write/ack              {"dir":"0x51", ...}
 ```
 
-The bridge uses **LWT** (`dsp408/<id>/status` → `offline`) so HA marks
-a device offline immediately if the bridge crashes or loses the USB
-connection, and re-enumerates hot-plugged devices every ~1 second.
-
-Full per-channel EQ / crossover / delay entities will land once the
-`0x77NN` 296-byte layout is decoded live. The `cmps` dict in
-`dsp408/mqtt.py::DeviceWorker.build_discovery_payload()` is where to
-add them.
+The bridge re-enumerates hot-plugged devices every ~1 second, so
+plugging or unplugging a DSP-408 while the bridge is running spawns
+or reaps the matching worker thread without a restart.
 
 ## Library
 
