@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
 """
-DSP-408 USB HID Interface
+DSP-408 USB HID Interface -- LEGACY / OBSOLETE
 
-Protocol: DLE/STX framing over 64-byte HID reports
+⚠️  This file is preserved for historical reference only.
+    It implements DLE/STX (WMCU) framing, which was reverse-engineered from
+    a TCP capture of the device's network stack -- NOT its USB port.
+    Windows captures (see captures/windows-01*.pcapng) subsequently proved
+    the USB transport uses a completely different envelope:
+
+        80 80 80 ee | dir | 01 | seq | byte7 | cmd_le_u32 | len_le_u16 | data | chk | aa
+
+    Use the new `dsp408` package (dsp408/frame.py, dsp408/device.py) for
+    anything touching the live device. This file is kept so that
+    `git log` + `git blame` still show the dead-end we went down.
+
+Protocol: DLE/STX framing over 64-byte HID reports -- WRONG FOR USB, KEPT AS REFERENCE
   - STX: 0x10 0x02
   - Sequence: 2 bytes (0x00 0x01 for host->device, 0x01 0x00 for device->host)
   - Command: 1 byte
