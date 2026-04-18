@@ -480,7 +480,7 @@ def build_ui() -> gr.Blocks:
                     "wired yet. Use the **Raw Console** for now."
                 )
                 with gr.Row():
-                    master_vol = gr.Slider(
+                    gr.Slider(
                         MASTER_VOLUME_MIN, MASTER_VOLUME_MAX, value=-20,
                         step=1, label="Master volume (dB) — placeholder",
                     )

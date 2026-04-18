@@ -5,7 +5,7 @@ description = "Dayton Audio DSP-408 USB control library + Gradio web UI (Linux-f
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "usb_dsp_mac contributors" }]
+authors = [{ name = "dsp408-py contributors" }]
 keywords = ["dsp", "dsp-408", "dayton-audio", "usb-hid", "reverse-engineering"]
 
 # Runtime dependencies. hidapi is the USB transport; gradio is only
@@ -30,8 +30,8 @@ dev = [
 dsp408 = "dsp408.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/mbelleau/usb_dsp_mac"
-Repository = "https://github.com/mbelleau/usb_dsp_mac"
+Homepage = "https://github.com/malaiwah/dsp408-py"
+Repository = "https://github.com/malaiwah/dsp408-py"
 
 # ── build-system ──────────────────────────────────────────────────────
 [build-system]
@@ -45,6 +45,7 @@ packages = ["dsp408"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+extend-exclude = ["dsp-408-ui", "downloads"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP"]

@@ -230,7 +230,7 @@ class DeviceWorker:
         return {
             "dev": dev,
             "o": {"name": "dsp408", "sw": "0.1.0",
-                  "url": "https://github.com/mbelleau/usb_dsp_mac"},
+                  "url": "https://github.com/malaiwah/dsp408-py"},
             "avty": avty,
             "avty_mode": "all",
             "cmps": cmps,

@@ -2,80 +2,37 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.egg-info/
+dist/
+build/
+
+# ── uv / venv ─────────────────────────────────────────────────────────────
 .venv/
 venv/
+.uv_cache/
+
+# ── Tool caches ───────────────────────────────────────────────────────────
 .ruff_cache/
 .mypy_cache/
 .pytest_cache/
-*.egg-info/
 
 # ── macOS ─────────────────────────────────────────────────────────────────
 .DS_Store
-.AppleDouble
-.LSOverride
 ._*
 
-# ── Xcode / DriverKit build artifacts ─────────────────────────────────────
-macos_hid_driver/build/
-macos_hid_driver/DerivedData/
-macos_hid_driver/*.xcodeproj/xcuserdata/
-macos_hid_driver/*.xcodeproj/project.xcworkspace/xcuserdata/
-macos_hid_driver/test_after_driver
-macos_hid_driver/dext_activate
-
-# ── Compiled diagnostic binaries (rebuilt easily from sources) ────────────
-macos_hid_diag/force_hid_prop
-macos_hid_diag/iohidif_open
-macos_hid_diag/hid_svc_client
-macos_hid_diag/usb_direct
-macos_hid_diag/iokit_clean
-macos_hid_diag/iokit_clean2
-macos_hid_diag/search_prop
-macos_hid_diag/iokit_seize
-macos_hid_diag/corehid_*
-!macos_hid_diag/corehid_*.swift
-macos_hid_diag/hid_*
-!macos_hid_diag/hid_*.c
-!macos_hid_diag/hid_*.swift
-!macos_hid_diag/hid_*.sh
-macos_hid_diag/test_bulk
-macos_hid_diag/test_iokit_usb
-macos_hid_diag/usb_read_test
-macos_hid_diag/err_decode
-macos_hid_diag/dump_hid_descriptor
-macos_hid_diag/try_alt_report_types
-
-# ── Vendored / extracted reference material ───────────────────────────────
-# Keep firmware binary and manual PDF in downloads/ — they're small refs.
-# Skip the extracted Windows installer tree (the .zip itself is kept).
-downloads/DSP-408-Windows/
-
-# Unrelated large reference zip (SPA250 is a different product, 185 MB) —
-# keep locally for reference but never push to origin.
-downloads/SPA250DSP.zip
-
-# Binwalk-extracted .exe contents — regenerate with
-# `binwalk -e -C extracted DSP-408.exe` from macos_hid_diag/exe_analysis/.
-macos_hid_diag/exe_analysis/extracted/
-# False-positive "embedded firmware" from an early analysis step — kept
-# the produce-it script (find_payload.py) instead.
-macos_hid_diag/exe_analysis/embedded_firmware.bin
-
-# ── Nested third-party project (clone separately if needed) ───────────────
-dsp-408-ui/
-
-# ── Empty placeholder ─────────────────────────────────────────────────────
-hidapi_patch/
-
-# ── IDE ───────────────────────────────────────────────────────────────────
+# ── Editor / local tooling ────────────────────────────────────────────────
 .vscode/
 .idea/
 .claude/
 *.swp
 
-# ── uv / python project build ─────────────────────────────────────────
-.venv/
-.uv_cache/
-*.egg-info/
-dist/
-build/
+# ── Leftover reverse-engineering artifacts (kept on RE branch) ────────────
+# If you checked out `main` after having had the RE files locally, these
+# stay on disk. They are preserved on the `reverse-engineering` branch.
+captures/
+downloads/
+firmware_patch/
+macos_hid_diag/
+macos_hid_driver/
+dsp-408-ui/
+hidapi_patch/

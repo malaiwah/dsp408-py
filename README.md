@@ -1,4 +1,6 @@
-# usb_dsp_mac — Dayton Audio DSP-408 USB control, reverse-engineered
+# dsp408-py — Dayton Audio DSP-408 USB control, reverse-engineered
+
+[![CI](https://github.com/malaiwah/dsp408-py/actions/workflows/ci.yml/badge.svg)](https://github.com/malaiwah/dsp408-py/actions/workflows/ci.yml)
 
 A from-scratch, cross-platform (Linux/macOS) implementation of the
 Dayton Audio **DSP-408** USB control protocol, reverse-engineered from
@@ -58,7 +60,7 @@ uv run dsp408 read 0x04                 # raw read by cmd code
 uv run dsp408 read-channel 0            # 296-byte channel-state blob
 uv run dsp408 write 1f07 "01 00 96 01 00 00 00 12" --cat 04
 uv run dsp408 poll --interval 1
-uv run dsp408 flash firmware_patch/DSP-408-Firmware-V6.21-PATCHED-hidpage.bin
+uv run dsp408 flash path/to/DSP-408-Firmware.bin
 uv run dsp408 mqtt --broker mqtt.local --username ha --password secret
 ```
 
@@ -164,9 +166,10 @@ offset  len  field            notes
 rest         padding          00 ...
 ```
 
-Full analysis (including multi-frame reads, firmware upload flow,
-bootloader integrity finding, and 7 decoded Windows captures) lives in
-`captures/`.
+Full analysis — multi-frame reads, firmware upload flow, bootloader
+integrity finding, 7 decoded Windows USBPcap captures, macOS IOKit
+seizure experiments, and a DriverKit `.dext` stub — lives on the
+[`reverse-engineering`](../../tree/reverse-engineering) branch.
 
 ## Tests
 
@@ -178,12 +181,18 @@ Tests cover frame round-trips against literal capture bytes (15),
 multi-device enumeration logic (11), and MQTT discovery shape (6).
 No real USB or broker required.
 
-## Related files
+## Reverse-engineering history
 
-- `captures/README.md` — capture methodology + findings log
-- `firmware_patch/README.md` — patched-firmware experiment (noop + HID Usage Page)
-- `flash_firmware.py` — standalone Windows-tested flasher (predates the library)
-- `dsp408_legacy.py` — the abandoned DLE/STX implementation (TCP protocol, wrong for USB)
+All USB captures, decoded traces, firmware-patch experiments, macOS
+IOKit diagnostic binaries, early interface prototypes, and the
+DriverKit stub are preserved on the
+[`reverse-engineering`](../../tree/reverse-engineering) branch. Check
+it out if you want to see how the protocol was decoded:
+
+```bash
+git fetch origin reverse-engineering
+git checkout reverse-engineering
+```
 
 ## Hardware facts (from the manual, for reference)
 
