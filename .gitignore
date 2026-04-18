@@ -71,3 +71,10 @@ hidapi_patch/
 .vscode/
 .idea/
 *.swp
+
+# ── uv / python project build ─────────────────────────────────────────
+.venv/
+.uv_cache/
+*.egg-info/
+dist/
+build/

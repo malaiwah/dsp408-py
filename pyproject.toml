@@ -1,0 +1,48 @@
+[project]
+name = "dsp408"
+version = "0.1.0"
+description = "Dayton Audio DSP-408 USB control library + Gradio web UI (Linux-first, cross-platform)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "usb_dsp_mac contributors" }]
+keywords = ["dsp", "dsp-408", "dayton-audio", "usb-hid", "reverse-engineering"]
+
+# Runtime dependencies. hidapi is the USB transport; gradio is only
+# required for `webui.app`. Both install cleanly on Linux (Pi) and macOS.
+dependencies = [
+    "hidapi>=0.14",
+]
+
+[project.optional-dependencies]
+ui = [
+    "gradio>=4.44,<6",
+]
+dev = [
+    "pytest>=7",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+dsp408 = "dsp408.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/mbelleau/usb_dsp_mac"
+Repository = "https://github.com/mbelleau/usb_dsp_mac"
+
+# ── build-system ──────────────────────────────────────────────────────
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["dsp408"]
+
+# ── ruff ──────────────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP"]
+ignore = ["E501"]  # line length handled by formatter
