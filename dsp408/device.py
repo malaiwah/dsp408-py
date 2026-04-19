@@ -1381,12 +1381,17 @@ class Device:
         """Write per-channel compressor parameters (cmd=0x2300+ch).
 
         ⚠ **The compressor block is INERT in firmware v1.06**
-        (``MYDW-AV1.06``, the only firmware we've seen).  Three-way
-        confirmation — (a) live audio rig: no audible compression at
-        any parameter combination, (b) firmware disasm: no DSP code
-        path reads the compressor blob slot, (c) leon Android source:
-        the Windows GUI's toggle button just bundles a write with
-        defaults, no follow-up "engage" signal anywhere.
+        (``MYDW-AV1.06``, the only firmware we've seen).  **Four-way
+        confirmation** as of 2026-04-19:
+          (a) live audio rig: no audible compression at any parameter
+              combination across six negative-result theories;
+          (b) firmware disasm: no DSP code path reads the compressor
+              blob slot at offsets 278..285;
+          (c) leon Android source: no enable bit in the wire format,
+              no audio-engine consumer of the parameters;
+          (d) **Windows GUI: the official DSP-408.exe V1.24 GUI does
+              not expose any compressor controls anywhere.** Confirms
+              the feature was scrubbed from the user-facing UI too.
 
         Wire encoding is decoded + round-trip-verified at blob[278..285]
         per leon DataID=35:
@@ -1530,22 +1535,28 @@ class Device:
         Lands at blob[70..77] of the input-state blob (verified live
         2026-04-19). 8-byte payload per leon source field labels:
 
-        ====  ============  ====================================
-        byte  field         meaning (per leon — uncalibrated)
-        ====  ============  ====================================
-        0     feedback      flag; semantics unverified
-        1     polar         0=normal, 1=phase invert
-        2     mode          0=??, 1=??
-        3     muted         0=audible, 1=muted
-        4..5  delay_le16    delay (samples or cm-step?)
-        6     volume        u8; semantics unverified
-        7     spare         always 0 in our writes
-        ====  ============  ====================================
+        ====  ============  ===========================================
+        byte  field         meaning + audio behavior (live-verified)
+        ====  ============  ===========================================
+        0     feedback      flag; semantics unverified, audio inert
+        1     **polar**     **WORKS** — 0=normal, 1=phase invert (180°,
+                            verified by Scarlett correlation flip)
+        2     mode          0/1; semantics unverified, audio inert
+        3     muted         INERT — bytes round-trip but no attenuation
+        4..5  delay_le16    INERT — bytes round-trip but no audible delay
+        6     volume        INERT — full 0..255 sweep produced 0.00 dB
+                            change in measured output
+        7     spare         always 0
+        ====  ============  ===========================================
 
-        ⚠ Field semantics labeled per leon's source but **not yet
-        calibrated against audio**. polar/muted/delay should mirror
-        the per-output equivalents but verify on the rig before
-        trusting individual fields.
+        ⚠ **Only ``polar`` is wired to audio in firmware v1.06.** The
+        other named fields exist on the wire (per leon's data model)
+        and round-trip exactly through ``read_input_state``, but the
+        audio engine doesn't consume them. Same pattern as the
+        compressor and VU-meters: planned-but-not-implemented features
+        with full UI/wire scaffolding. Use
+        :meth:`set_routing_levels` (per-input mixer cell levels) for
+        actual input-level control.
         """
         if not 0 <= input_ch < INPUT_CHANNEL_COUNT:
             raise ValueError(
@@ -1584,17 +1595,20 @@ class Device:
     ) -> None:
         """Write one parametric-EQ band on one input channel.
 
-        Mirror of :meth:`set_eq_band` but for the input side. Up to
-        15 bands per input per leon spec (DataID=0..14); writes to
-        higher band indices may silently no-op (not verified).
+        ⚠ **INERT in firmware v1.06.** Wire writes round-trip through
+        ``read_input_state`` but do not affect audio. Live-verified
+        2026-04-19: writing band 5 with +12 dB peak at 1 kHz produced
+        a 0.00 dB change in measured frequency response. Same pattern
+        as the rest of the input-processing subsystem (only POLAR
+        works) — the firmware exposes the wire surface but doesn't
+        consume the parameters.
 
-        ``cmd = (band << 8) | input_ch`` with cat=0x03.
+        Wire encoding still useful for state preservation /
+        forward-compat with future firmware revisions.
 
-        Note: input EQ bands have a layout quirk — bands 0..5 use 8-byte
-        stride starting at offset 0, but the structure shifts after that
-        in ways we haven't fully decoded. Per-band writes round-trip
-        through the read but the offset map is approximate. See
-        ``tests/loopback/_probe_input_writes.py``.
+        ``cmd = (band << 8) | input_ch`` with cat=0x03. Up to 15 bands
+        per input per leon spec (DataID=0..14, minus 9/10/11 used by
+        MISC/unknown/noisegate).
         """
         if not 0 <= input_ch < INPUT_CHANNEL_COUNT:
             raise ValueError(
@@ -1641,13 +1655,14 @@ class Device:
     ) -> None:
         """Write input noisegate parameters (cmd=0x0B00+ch cat=0x03, DataID=11).
 
-        Lands at blob[86..93] of the input-state blob (verified live
-        2026-04-19 via distinctive-byte injection — output 8 bytes
-        appeared exactly).
+        ⚠ **INERT in firmware v1.06.** Wire write lands at blob[86..93]
+        and round-trips, but live-verified 2026-04-19 the audio engine
+        does not gate: setting threshold=200 with attack=10 / knee=10 /
+        release=10 / config=0xFF and feeding a -50 dBFS signal produced
+        no attenuation vs ungated baseline. Same pattern as the rest
+        of the input subsystem.
 
-        Field labels follow leon source; semantic units (dB? ms?
-        samples?) are **not yet calibrated against audio behavior**.
-        Test on the rig before relying on specific values.
+        Wire encoding kept for state preservation / forward-compat.
 
         Args:
             input_ch:  0..7
@@ -1786,25 +1801,40 @@ class Device:
 
     # ── speaker-template helper ────────────────────────────────────────
     def apply_speaker_template(self, channel: int, template: str) -> None:
-        """Apply a speaker template (auto-config crossover + spk_type).
+        """Apply a speaker template (assigns the channel to a DSP slot).
 
         Per leon source ``OutputSPKSetActivity.java``, picking a speaker
-        role in the GUI (Subwoofer / FL_Tweeter / Center / etc.) writes
-        a single integer to the per-output ``spk_type`` byte
-        (blob[253]). The chip itself owns the tonal defaults — leon
-        does NOT cascade EQ/crossover writes from a template lookup
-        table. So this method is just a thin wrapper around set_channel
-        with a mnemonic instead of a raw subidx number.
+        role in the GUI just writes a single integer to the per-output
+        ``spk_type`` byte (blob[253]). leon does NOT cascade
+        EQ/crossover writes from a template lookup table — the firmware
+        DSP itself owns whatever happens.
 
-        Templates accepted (per leon's enum order, 1-indexed):
-          'fl_tweeter', 'fl_midrange', 'fl_woofer',
-          'fr_tweeter', 'fr_midrange', 'fr_woofer',
-          'center', 'sub', 'sub_l', 'sub_r', 'rl', 'rr',
-          'aux1', 'aux2', 'aux3', 'aux4', 'none'.
+        ⚠ **Big gain side-effect, NOT tonal shaping.** Live-verified
+        2026-04-19: changing spk_type produces a flat ~+18 dB gain
+        change across the spectrum (same delta at 100 Hz / 1 kHz /
+        10 kHz). It does NOT apply a speaker-specific HPF/LPF/EQ. So
+        switching from "fl" to "sub" doesn't make the output a
+        subwoofer crossover — it just bumps gain by ~18 dB. Different
+        templates that produced the SAME gain change in our test:
+        ``"sub"`` and ``"fl"`` (both +17.9 dB vs the prior baseline).
 
-        Speaker tonal defaults (HPF/LPF/EQ) are loaded by the firmware
-        when the spk_type byte changes — so calling this after a write
-        will overwrite any custom EQ/crossover the user had set.
+        Best understanding: the firmware reassigns the channel to a
+        different DSP processing slot when spk_type changes, and
+        certain slots have different internal pre-gain. The "speaker
+        template" name is misleading — there's no built-in tonal
+        intelligence here; users still need to set HPF/LPF/EQ
+        themselves via the typed methods.
+
+        Templates accepted (per leon's enum order, 0-indexed in
+        ``SPK_TYPE_NAMES``):
+          ``none, fl_high, fl_mid, fl_low, fl, fr_high, fr_mid,
+           fr_low, fr, rl_high, rl_mid, rl_low, rl, rr_high, rr_mid,
+           rr_low, rr, center, sub, sub_l, sub_r, aux1, aux2, aux3,
+           aux4``.
+
+        Recommended use: leave at the factory default
+        (``CHANNEL_SUBIDX[channel]``) unless you specifically need to
+        match the firmware's expectation for a particular DSP slot.
         """
         from .protocol import SPK_TYPE_NAMES
         if not 0 <= channel <= 7:

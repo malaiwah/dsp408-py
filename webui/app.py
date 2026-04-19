@@ -458,6 +458,21 @@ def do_read_input_summary(input_n: int) -> str:
             f"k={nz[2]} r={nz[3]} cfg={nz[4]:#04x}]")
 
 
+# ── Mixer row (4-cell routing) ────────────────────────────────────────
+def do_set_routing_row(out_n: int, c1: int, c2: int, c3: int, c4: int) -> str:
+    """Write a 4-cell routing row for output ``out_n`` (1-indexed) — each
+    cell is u8 0..255. Live-verified wire encoding (cmd=0x2100+ch)."""
+    cells = [int(c1), int(c2), int(c3), int(c4)]
+    for i, c in enumerate(cells, 1):
+        if not 0 <= c <= 255:
+            return f"error: IN{i}={c} out of [0, 255]"
+    try:
+        SESSION.safe_call(lambda d: d.set_routing_levels(int(out_n) - 1, cells))
+    except Exception as e:
+        return f"error: {e}"
+    return f"OUT{out_n} row written: IN1={cells[0]} IN2={cells[1]} IN3={cells[2]} IN4={cells[3]}"
+
+
 # ── Firmware flashing ──────────────────────────────────────────────────
 def do_flash(fw_file) -> str:
     """Flash the selected .bin firmware onto the currently-picked device.
@@ -680,62 +695,94 @@ def build_ui() -> gr.Blocks:
                                              label="Type")
 
             # ── Inputs tab — DataType=3 (cat=0x03) input processing ──
-            # Per leon source + live verification, each of the 4 RCA + 4
-            # high-level inputs has independent gain/mute/polar/delay
-            # before the routing matrix. Wire-verified 2026-04-19.
+            # Live-verified 2026-04-19 on the loopback rig: of the 6
+            # leon-documented input MISC fields, ONLY phase invert
+            # actually affects audio in firmware v1.06. mute / delay /
+            # volume / EQ / noisegate all wire-round-trip but are inert
+            # (planned-but-not-implemented, same pattern as the
+            # compressor and VU meters which are also dead).
             with gr.Tab("Inputs"):
                 gr.Markdown(
-                    "**Input-side processing** (DSP-408 firmware exposes 8 "
-                    "input slots — typically the 4 RCA + 4 high-level + 1 "
-                    "BT, with cells 6+ unused on this hardware revision). "
-                    "Wire writes verified live; field semantics labeled "
-                    "per leon Android source — units uncalibrated."
+                    "**Input-side processing.** Of the leon-documented "
+                    "MISC fields, **only phase invert is wired to audio "
+                    "in firmware v1.06** — mute / delay / volume / EQ / "
+                    "noisegate were verified inert on the loopback rig "
+                    "(same planned-but-not-implemented pattern as the "
+                    "compressor and VU meters). For input-level control "
+                    "use the **per-cell mixer percentages** in the Mixer "
+                    "tab — those work."
                 )
                 for ic in range(1, 9):
                     with gr.Accordion(f"IN{ic}", open=(ic == 1)):
                         with gr.Row():
-                            in_muted = gr.Checkbox(label="Mute")
-                            in_polar = gr.Checkbox(label="Phase invert (180°)")
-                        with gr.Row():
-                            in_delay = gr.Number(
-                                label="Delay (samples, u16)",
-                                value=0, minimum=0, maximum=0xFFFF, step=1,
+                            in_polar = gr.Checkbox(
+                                label="Phase invert (180°) — LIVE",
                             )
-                            in_volume = gr.Slider(
-                                0, 255, value=0, step=1,
-                                label="Volume (raw u8)",
-                            )
-                        with gr.Row():
-                            in_apply = gr.Button("Apply", scale=1)
+                            in_apply = gr.Button("Apply phase", scale=1)
                             in_read = gr.Button("↻ Read state", scale=1)
                         in_log = gr.Textbox(
                             label="result", interactive=False,
                         )
                         in_apply.click(
-                            fn=lambda mu, po, d, v, _ic=ic: do_set_input(
-                                _ic, mu, po, d, v),
-                            inputs=[in_muted, in_polar, in_delay, in_volume],
+                            fn=lambda po, _ic=ic: do_set_input(
+                                _ic, False, po, 0, 0),
+                            inputs=[in_polar],
                             outputs=in_log,
                         )
                         in_read.click(
                             fn=lambda _ic=ic: do_read_input_summary(_ic),
                             outputs=in_log,
                         )
+                        gr.Markdown(
+                            "_Mute / delay / volume / EQ / noisegate not "
+                            "exposed here — they're inert in this firmware._"
+                        )
 
-            # ── Mixer tab (placeholder) ───────────────────────────
+            # ── Mixer tab — LIVE per-cell percentage matrix ───────
+            # The Windows GUI hides this behind a button (the user
+            # discovered 2026-04-19); our driver has always supported
+            # it via set_routing_levels with u8 0..255 cells. 100 =
+            # unity gain (default), 0 = off, values above 100 = boost
+            # up to ~+8 dB at 255.
             with gr.Tab("Mixer"):
                 gr.Markdown(
-                    "4 inputs × 8 outputs routing matrix — placeholder."
+                    "**4 inputs × 8 outputs routing matrix.** Each cell "
+                    "is u8 0..255 (firmware accepts the full range): "
+                    "**100 = unity gain** (default), 50 = -6 dB, 0 = off, "
+                    "200 = +6 dB, 255 = +8 dB. The Windows GUI hides "
+                    "non-binary values behind a click-through; we expose "
+                    "them directly. Apply rewrites the entire row for "
+                    "the chosen output."
                 )
-                # A simple grid of sliders
+                gr.Markdown(
+                    "_Live-validated wire encoding: see "
+                    "`tests/loopback/test_routing_percentage.py`._"
+                )
+                # Build per-output rows, with 4 cells (DSP-408 has 4
+                # physical inputs; firmware accepts 8 cells but cells
+                # 5..8 are silent on this hw).
                 for out_ch in range(1, NUM_OUTPUT_CHANNELS + 1):
                     with gr.Row():
-                        gr.Markdown(f"**CH{out_ch} ←**")
+                        gr.Markdown(f"**OUT{out_ch} ←**", scale=1)
+                        cell_widgets = []
                         for in_ch in range(1, NUM_INPUTS + 1):
-                            gr.Slider(
-                                0, 100, value=100 if in_ch == ((out_ch - 1) % 4) + 1 else 0,
-                                step=1, label=f"IN{in_ch}",
+                            cell = gr.Number(
+                                label=f"IN{in_ch}",
+                                value=100 if (in_ch - 1) == ((out_ch - 1) % 4) else 0,
+                                minimum=0, maximum=255, step=1,
+                                scale=1,
                             )
+                            cell_widgets.append(cell)
+                        apply_btn = gr.Button("Apply row", scale=1)
+                        row_log = gr.Textbox(
+                            label="", interactive=False, scale=2,
+                        )
+                        apply_btn.click(
+                            fn=lambda c1, c2, c3, c4, _o=out_ch: (
+                                do_set_routing_row(_o, c1, c2, c3, c4)),
+                            inputs=cell_widgets,
+                            outputs=row_log,
+                        )
 
             # ── Snapshot / diagnostics ────────────────────────────
             with gr.Tab("Snapshot"):

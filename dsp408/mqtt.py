@@ -455,24 +455,13 @@ class DeviceWorker:
                 }
                 for n in range(1, 9)
             },
-            # ── Input-side processing (DataType=3, cat=0x03, 4 active
-            # RCA + 4 high-level inputs). Per-input volume / mute /
-            # phase / delay / noisegate via Device.set_input* methods.
-            # Wire fully verified live 2026-04-19. Field semantics
-            # labeled per leon source — units uncalibrated.
-            **{
-                f"in{n}_mute": {
-                    "p": "switch",
-                    "name": f"Input {n} mute",
-                    "uniq_id": f"dsp408_{self.slug}_in{n}_mute",
-                    "stat_t": self.t(f"in{n}_mute/state"),
-                    "cmd_t": self.t(f"in{n}_mute/set"),
-                    "pl_on": "ON",
-                    "pl_off": "OFF",
-                    "icon": "mdi:microphone-off",
-                }
-                for n in range(1, 9)
-            },
+            # ── Input-side processing (DataType=3, cat=0x03). Live
+            # audio validation 2026-04-19 found ONLY ``polar`` actually
+            # affects audio in firmware v1.06; mute/delay/volume/EQ/
+            # noisegate all wire-round-trip but are inert (same
+            # planned-but-not-implemented pattern as the compressor and
+            # VU meters). For real input-level control use the
+            # per-cell mixer levels (out{N}_in{M}_level above).
             **{
                 f"in{n}_polar": {
                     "p": "switch",
@@ -483,39 +472,6 @@ class DeviceWorker:
                     "pl_on": "ON",
                     "pl_off": "OFF",
                     "icon": "mdi:sine-wave",
-                    "ent_cat": "config",
-                }
-                for n in range(1, 9)
-            },
-            **{
-                f"in{n}_delay": {
-                    "p": "number",
-                    "name": f"Input {n} delay",
-                    "uniq_id": f"dsp408_{self.slug}_in{n}_delay",
-                    "stat_t": self.t(f"in{n}_delay/state"),
-                    "cmd_t": self.t(f"in{n}_delay/set"),
-                    "min": 0,
-                    "max": 0xFFFF,
-                    "step": 1,
-                    "unit_of_meas": "samples",
-                    "icon": "mdi:timer-outline",
-                    "mode": "box",
-                    "ent_cat": "config",
-                }
-                for n in range(1, 9)
-            },
-            **{
-                f"in{n}_volume_raw": {
-                    "p": "number",
-                    "name": f"Input {n} volume (raw)",
-                    "uniq_id": f"dsp408_{self.slug}_in{n}_volume_raw",
-                    "stat_t": self.t(f"in{n}_volume_raw/state"),
-                    "cmd_t": self.t(f"in{n}_volume_raw/set"),
-                    "min": 0,
-                    "max": 255,
-                    "step": 1,
-                    "icon": "mdi:tune-vertical-variant",
-                    "mode": "slider",
                     "ent_cat": "config",
                 }
                 for n in range(1, 9)
@@ -654,14 +610,8 @@ class DeviceWorker:
                 self._handle_ch_delay(topic, text)
             elif topic.startswith(self.t("ch")) and topic.endswith("_name/set"):
                 self._handle_ch_name(topic, text)
-            elif topic.startswith(self.t("in")) and topic.endswith("_mute/set"):
-                self._handle_in_mute(topic, text)
             elif topic.startswith(self.t("in")) and topic.endswith("_polar/set"):
                 self._handle_in_polar(topic, text)
-            elif topic.startswith(self.t("in")) and topic.endswith("_delay/set"):
-                self._handle_in_delay(topic, text)
-            elif topic.startswith(self.t("in")) and topic.endswith("_volume_raw/set"):
-                self._handle_in_volume_raw(topic, text)
             # NOTE: order matters — check the longer "/level/set" suffix
             # *before* the catch-all bool route handler, otherwise a level
             # write would be parsed as a bool toggle.
@@ -829,18 +779,9 @@ class DeviceWorker:
             ]
         return self._input_cache[idx0]
 
-    def _handle_in_mute(self, topic: str, text: str) -> None:
-        n = self._input_idx_from_topic(topic)
-        muted = text.strip().upper() in ("ON", "TRUE", "1", "YES")
-        c = self._input_misc_cache(n - 1)
-        c["muted"] = muted
-        dev = self._ensure_device()
-        dev.set_input(n - 1, polar=c["polar"], muted=muted,
-                      delay_samples=c["delay"], volume=c["volume"])
-        self.publish(f"in{n}_mute/state", "ON" if muted else "OFF",
-                     retain=True, qos=1)
-
     def _handle_in_polar(self, topic: str, text: str) -> None:
+        """Set per-input phase invert (the only audibly-functional MISC
+        field in firmware v1.06)."""
         n = self._input_idx_from_topic(topic)
         polar = text.strip().upper() in ("ON", "TRUE", "1", "YES")
         c = self._input_misc_cache(n - 1)
@@ -850,36 +791,6 @@ class DeviceWorker:
                       delay_samples=c["delay"], volume=c["volume"])
         self.publish(f"in{n}_polar/state", "ON" if polar else "OFF",
                      retain=True, qos=1)
-
-    def _handle_in_delay(self, topic: str, text: str) -> None:
-        n = self._input_idx_from_topic(topic)
-        try:
-            samples = int(float(text.strip()))
-        except ValueError as e:
-            raise ValueError(f"delay must be an integer, got {text!r}") from e
-        if not 0 <= samples <= 0xFFFF:
-            raise ValueError(f"delay out of u16 range: {samples}")
-        c = self._input_misc_cache(n - 1)
-        c["delay"] = samples
-        dev = self._ensure_device()
-        dev.set_input(n - 1, polar=c["polar"], muted=c["muted"],
-                      delay_samples=samples, volume=c["volume"])
-        self.publish(f"in{n}_delay/state", str(samples), retain=True, qos=1)
-
-    def _handle_in_volume_raw(self, topic: str, text: str) -> None:
-        n = self._input_idx_from_topic(topic)
-        try:
-            vol = int(float(text.strip()))
-        except ValueError as e:
-            raise ValueError(f"volume must be an integer, got {text!r}") from e
-        if not 0 <= vol <= 0xFF:
-            raise ValueError(f"volume out of u8 range: {vol}")
-        c = self._input_misc_cache(n - 1)
-        c["volume"] = vol
-        dev = self._ensure_device()
-        dev.set_input(n - 1, polar=c["polar"], muted=c["muted"],
-                      delay_samples=c["delay"], volume=vol)
-        self.publish(f"in{n}_volume_raw/state", str(vol), retain=True, qos=1)
 
     def _handle_factory_reset(self) -> None:
         """EXPERIMENTAL: trigger the magic-word factory-reset register write.
@@ -1047,13 +958,10 @@ class DeviceWorker:
             "blob_tail_hex": blob[78:96].hex(),  # for advanced inspection
         }
         self.publish(f"in{n}_state/state", doc, retain=True, qos=1)
-        # Individual MISC entities so HA can wire automations on them
-        self.publish(f"in{n}_mute/state",
-                     "ON" if muted else "OFF", retain=True, qos=1)
+        # Polar is the only audibly-functional MISC field in firmware
+        # v1.06 (mute/delay/volume verified inert via loopback rig).
         self.publish(f"in{n}_polar/state",
                      "ON" if polar else "OFF", retain=True, qos=1)
-        self.publish(f"in{n}_delay/state", str(delay_samples), retain=True, qos=1)
-        self.publish(f"in{n}_volume_raw/state", str(volume), retain=True, qos=1)
 
     def _publish_channel_state(self, n: int, state: dict) -> None:
         """Publish the per-channel JSON state document.
