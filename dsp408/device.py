@@ -128,7 +128,6 @@ from .protocol import (
     CMD_GLOBAL_0x06,
     CMD_STATE_0x13,
     Frame,
-    build_frame,
 )
 from .transport import HidCompat, Transport
 
@@ -424,14 +423,22 @@ class Device:
             # the auto-increment so we can still match late replies to the
             # correct in-flight request.
             seq = 0 if direction == DIR_WRITE else self._next_seq()
-            frame = build_frame(
+            # Multi-frame WRITE for payloads > 48 bytes (e.g. the
+            # 296-byte channel-state writes the GUI emits for "Load
+            # from disk"). build_frames_multi returns a single-element
+            # list for small payloads.
+            from .protocol import build_frames_multi
+            frames = build_frames_multi(
                 direction=direction,
                 seq=seq,
                 cmd=cmd,
                 data=data,
                 category=category,
             )
-            self._t.send_frame(frame)
+            if len(frames) == 1:
+                self._t.send_frame(frames[0])
+            else:
+                self._t.send_frames(frames)
             if not expect_reply:
                 return None
             deadline = time.monotonic() + timeout_ms / 1000.0
@@ -1691,17 +1698,31 @@ class Device:
         raise ValueError(f"channel must be in 0..7, got {channel}")
 
     def set_full_channel_state(self, channel: int, blob: bytes) -> None:
-        """Write the entire 296-byte channel-state blob in one frame.
+        """Write the entire 296-byte channel-state blob in one logical frame.
 
         Decoded from ``captures/load_loaddisk_save_preset_bureau.pcapng``
-        (the GUI's "Load from disk" action). Useful for atomic state
-        backup/restore: ``read_channel_state`` + modify + this method.
+        (the GUI's "Load from disk" action). Cmd encoding has a TRAP:
+        channels 0..3 use cmd=0x10000+ch, channels 4..7 use
+        cmd=0x04+(ch-4) — the latter collides with
+        ``CMD_GET_INFO=0x04`` for READS (dir=a2, len=8) but is
+        disambiguated by direction + payload length.
 
-        ⚠ Cmd encoding has a TRAP: channels 0..3 use cmd=0x10000+ch,
-        channels 4..7 use cmd=0x04+(ch-4). The latter range collides
-        with ``CMD_GET_INFO=0x04`` for READS (dir=a2, len=8) — the
-        firmware disambiguates by direction + payload length, but
-        anyone reading raw frames needs to know this.
+        Sends the 296-byte payload as one logical frame split across 5
+        HID reports (transport-level multi-frame WRITE — wire pattern
+        verified byte-for-byte against the captured GUI bytes 2026-04-19;
+        device acks the write).
+
+        ⚠ **2-byte payload loss is inherent to the firmware's
+        multi-frame WRITE handling.** Live-verified 2026-04-19: the
+        firmware appears to consume only 48 bytes of payload from the
+        first HID frame even though the GUI sends 50 (and we faithfully
+        replicate this), then starts continuation frames at logical-
+        payload offset 48. Net effect: bytes 48..49 of the input
+        ``blob`` are SILENTLY DROPPED. The Windows GUI exhibits the
+        same behavior — replaying the captured GUI bytes verbatim
+        produces the same readback. Workaround: read after the write
+        and verify; or pad your blob's bytes 48..49 with the same
+        values as bytes 50..51 to make the loss invisible.
         """
         if len(blob) != 296:
             raise ValueError(f"blob must be 296 bytes, got {len(blob)}")
@@ -1719,12 +1740,9 @@ class Device:
           2. Set preset name to ``name`` (cmd=0x00).
           3. Bulk-write all 8 channels' full state via
              :meth:`set_full_channel_state` (cmd=0x10000..0x10003 then
-             cmd=0x04..0x07 with 296-byte payloads).
+             cmd=0x04..0x07 with 296-byte payloads). ← needs multi-frame.
 
-        ⚠ Destructive on the chosen slot. The firmware appears to
-        commit to flash (per the cmd=0x34 trigger and the ~430 ms
-        latency we see on similar magic-write commands). Testing on
-        the rig is needed to confirm persistence across power-cycles.
+        Destructive on the chosen slot once functional.
         """
         # Step 1: tell firmware "begin save transaction"
         self.write_raw(cmd=CMD_PRESET_SAVE_TRIGGER,
@@ -1734,7 +1752,8 @@ class Device:
         encoded = name.encode("ascii", errors="ignore")[:15]
         name_payload = encoded + b"\x00" * (15 - len(encoded)) + b"\x00"
         self.write_raw(cmd=CMD_PRESET_NAME, data=name_payload, category=CAT_STATE)
-        # Step 3: dump full channel state for all 8 channels
+        # Step 3: dump full channel state for all 8 channels (currently
+        # blocked by multi-frame-write limitation — see set_full_channel_state)
         for ch in range(8):
             blob = self.read_channel_state(ch)
             self.set_full_channel_state(ch, bytes(blob))
@@ -1742,17 +1761,70 @@ class Device:
     def load_preset_by_name(self, name: str) -> None:
         """Load a named preset from internal flash by setting its name.
 
-        From ``load_loaddisk_save_preset_bureau.pcapng`` the GUI's
-        "Load Preset" action just writes the preset name (cmd=0x00).
-        The firmware looks up the slot internally and swaps state.
-        Lightweight — no bulk channel writes required.
+        Wire encoding from ``load_loaddisk_save_preset_bureau.pcapng``:
+        the GUI's "Load Preset" action just writes the preset name
+        (cmd=0x00). Lightweight — no bulk channel writes required.
 
-        If the name doesn't match a saved slot, behavior is unknown
-        (the firmware may silently keep current state).
+        ⚠ **Empirically: the readback of preset name doesn't reflect
+        this write on a fresh / factory-reset device.** The wire bytes
+        match the captured GUI exactly and the device acks normally,
+        but `read_preset_name()` returns empty regardless. Possible
+        explanations:
+          * The firmware only updates the readable name when a preset
+            with that name actually exists in internal flash.
+          * The name field requires a prior :meth:`save_preset` cycle
+            to be persistable.
+          * The captured GUI's success may have been state-dependent
+            (it had a "Bureau" preset already saved).
+        Real preset-load semantics are still partly unverified; treat
+        this as "send the bytes the GUI sends" and watch device
+        behavior — it may swap state silently.
         """
         encoded = name.encode("ascii", errors="ignore")[:15]
         payload = encoded + b"\x00" * (15 - len(encoded)) + b"\x00"
         self.write_raw(cmd=CMD_PRESET_NAME, data=payload, category=CAT_STATE)
+
+    # ── speaker-template helper ────────────────────────────────────────
+    def apply_speaker_template(self, channel: int, template: str) -> None:
+        """Apply a speaker template (auto-config crossover + spk_type).
+
+        Per leon source ``OutputSPKSetActivity.java``, picking a speaker
+        role in the GUI (Subwoofer / FL_Tweeter / Center / etc.) writes
+        a single integer to the per-output ``spk_type`` byte
+        (blob[253]). The chip itself owns the tonal defaults — leon
+        does NOT cascade EQ/crossover writes from a template lookup
+        table. So this method is just a thin wrapper around set_channel
+        with a mnemonic instead of a raw subidx number.
+
+        Templates accepted (per leon's enum order, 1-indexed):
+          'fl_tweeter', 'fl_midrange', 'fl_woofer',
+          'fr_tweeter', 'fr_midrange', 'fr_woofer',
+          'center', 'sub', 'sub_l', 'sub_r', 'rl', 'rr',
+          'aux1', 'aux2', 'aux3', 'aux4', 'none'.
+
+        Speaker tonal defaults (HPF/LPF/EQ) are loaded by the firmware
+        when the spk_type byte changes — so calling this after a write
+        will overwrite any custom EQ/crossover the user had set.
+        """
+        from .protocol import SPK_TYPE_NAMES
+        if not 0 <= channel <= 7:
+            raise ValueError(f"channel must be in 0..7, got {channel}")
+        # Match leon's spk_type values via SPK_TYPE_NAMES table
+        try:
+            subidx = SPK_TYPE_NAMES.index(template)
+        except ValueError as e:
+            raise ValueError(
+                f"unknown template {template!r}; valid: {SPK_TYPE_NAMES}"
+            ) from e
+        cached = self.get_channel_cached(channel)
+        # Update the cache so set_channel writes the new subidx, then
+        # re-write the basic record to apply.
+        self._channel_cache[channel]["subidx"] = subidx
+        self.set_channel(channel,
+                         db=cached["db"],
+                         muted=cached["muted"],
+                         delay_samples=cached.get("delay", 0),
+                         polar=cached.get("polar", False))
 
     # ── one-shot snapshot ──────────────────────────────────────────────
     def snapshot(self) -> DeviceInfo:

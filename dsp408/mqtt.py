@@ -438,6 +438,103 @@ class DeviceWorker:
                 }
                 for n in range(1, 9)
             },
+            # ── Per-output channel name (8-byte ASCII label, r/w). ──
+            # Wire: cmd=0x2400+ch (DataID=36), lands at blob[286..293].
+            # Live-verified 2026-04-19. Lets HA users name channels
+            # "TWEETER", "SUB-LEFT", etc., from the dashboard.
+            **{
+                f"ch{n}_name": {
+                    "p": "text",
+                    "name": f"Channel {n} name",
+                    "uniq_id": f"dsp408_{self.slug}_ch{n}_name",
+                    "stat_t": self.t(f"ch{n}_name/state"),
+                    "cmd_t": self.t(f"ch{n}_name/set"),
+                    "max": 8,
+                    "icon": "mdi:label",
+                    "ent_cat": "config",
+                }
+                for n in range(1, 9)
+            },
+            # ── Input-side processing (DataType=3, cat=0x03, 4 active
+            # RCA + 4 high-level inputs). Per-input volume / mute /
+            # phase / delay / noisegate via Device.set_input* methods.
+            # Wire fully verified live 2026-04-19. Field semantics
+            # labeled per leon source — units uncalibrated.
+            **{
+                f"in{n}_mute": {
+                    "p": "switch",
+                    "name": f"Input {n} mute",
+                    "uniq_id": f"dsp408_{self.slug}_in{n}_mute",
+                    "stat_t": self.t(f"in{n}_mute/state"),
+                    "cmd_t": self.t(f"in{n}_mute/set"),
+                    "pl_on": "ON",
+                    "pl_off": "OFF",
+                    "icon": "mdi:microphone-off",
+                }
+                for n in range(1, 9)
+            },
+            **{
+                f"in{n}_polar": {
+                    "p": "switch",
+                    "name": f"Input {n} phase invert",
+                    "uniq_id": f"dsp408_{self.slug}_in{n}_polar",
+                    "stat_t": self.t(f"in{n}_polar/state"),
+                    "cmd_t": self.t(f"in{n}_polar/set"),
+                    "pl_on": "ON",
+                    "pl_off": "OFF",
+                    "icon": "mdi:sine-wave",
+                    "ent_cat": "config",
+                }
+                for n in range(1, 9)
+            },
+            **{
+                f"in{n}_delay": {
+                    "p": "number",
+                    "name": f"Input {n} delay",
+                    "uniq_id": f"dsp408_{self.slug}_in{n}_delay",
+                    "stat_t": self.t(f"in{n}_delay/state"),
+                    "cmd_t": self.t(f"in{n}_delay/set"),
+                    "min": 0,
+                    "max": 0xFFFF,
+                    "step": 1,
+                    "unit_of_meas": "samples",
+                    "icon": "mdi:timer-outline",
+                    "mode": "box",
+                    "ent_cat": "config",
+                }
+                for n in range(1, 9)
+            },
+            **{
+                f"in{n}_volume_raw": {
+                    "p": "number",
+                    "name": f"Input {n} volume (raw)",
+                    "uniq_id": f"dsp408_{self.slug}_in{n}_volume_raw",
+                    "stat_t": self.t(f"in{n}_volume_raw/state"),
+                    "cmd_t": self.t(f"in{n}_volume_raw/set"),
+                    "min": 0,
+                    "max": 255,
+                    "step": 1,
+                    "icon": "mdi:tune-vertical-variant",
+                    "mode": "slider",
+                    "ent_cat": "config",
+                }
+                for n in range(1, 9)
+            },
+            # Per-input full-state diagnostic JSON sensor (288-byte blob,
+            # decoded via parse_input_state_blob) — read-only summary.
+            **{
+                f"in{n}_state": {
+                    "p": "sensor",
+                    "name": f"Input {n} state",
+                    "uniq_id": f"dsp408_{self.slug}_in{n}_state",
+                    "stat_t": self.t(f"in{n}_state/state"),
+                    "val_tpl": "{{ value_json.summary }}",
+                    "json_attr_t": self.t(f"in{n}_state/state"),
+                    "ent_cat": "diagnostic",
+                    "icon": "mdi:audio-input-rca",
+                }
+                for n in range(1, 9)
+            },
         }
         return {
             "dev": dev,
@@ -555,6 +652,16 @@ class DeviceWorker:
                 self._handle_ch_polar(topic, text)
             elif topic.startswith(self.t("ch")) and topic.endswith("_delay/set"):
                 self._handle_ch_delay(topic, text)
+            elif topic.startswith(self.t("ch")) and topic.endswith("_name/set"):
+                self._handle_ch_name(topic, text)
+            elif topic.startswith(self.t("in")) and topic.endswith("_mute/set"):
+                self._handle_in_mute(topic, text)
+            elif topic.startswith(self.t("in")) and topic.endswith("_polar/set"):
+                self._handle_in_polar(topic, text)
+            elif topic.startswith(self.t("in")) and topic.endswith("_delay/set"):
+                self._handle_in_delay(topic, text)
+            elif topic.startswith(self.t("in")) and topic.endswith("_volume_raw/set"):
+                self._handle_in_volume_raw(topic, text)
             # NOTE: order matters — check the longer "/level/set" suffix
             # *before* the catch-all bool route handler, otherwise a level
             # write would be parsed as a bool toggle.
@@ -691,6 +798,89 @@ class DeviceWorker:
                         delay_samples=samples)
         self.publish(f"ch{n}_delay/state", str(samples), retain=True, qos=1)
 
+    def _handle_ch_name(self, topic: str, text: str) -> None:
+        """Set per-output channel name (cmd=0x2400+ch, DataID=36)."""
+        n = int(topic.rsplit("/ch", 1)[1].split("_")[0])
+        if not 1 <= n <= 8:
+            raise ValueError(f"channel {n} out of range")
+        name = text.strip()
+        dev = self._ensure_device()
+        dev.set_channel_name(n - 1, name)
+        # Publish back the (possibly truncated) value so HA reflects the
+        # actual stored name.
+        self.publish(f"ch{n}_name/state", name[:8], retain=True, qos=1)
+
+    # ── input-side processing handlers (DataType=3) ─────────────────────
+    @staticmethod
+    def _input_idx_from_topic(topic: str) -> int:
+        """Extract the 1-based input index from a topic like '<base>/inN_xxx/set'."""
+        n = int(topic.rsplit("/in", 1)[1].split("_")[0])
+        if not 1 <= n <= 8:
+            raise ValueError(f"input {n} out of range")
+        return n
+
+    def _input_misc_cache(self, idx0: int) -> dict:
+        """Lazy per-input MISC cache so individual field writes preserve
+        the others (mirror of how _handle_ch_delay preserves volume/mute)."""
+        if not hasattr(self, "_input_cache"):
+            self._input_cache: list[dict] = [
+                {"polar": False, "muted": False, "delay": 0, "volume": 0}
+                for _ in range(8)
+            ]
+        return self._input_cache[idx0]
+
+    def _handle_in_mute(self, topic: str, text: str) -> None:
+        n = self._input_idx_from_topic(topic)
+        muted = text.strip().upper() in ("ON", "TRUE", "1", "YES")
+        c = self._input_misc_cache(n - 1)
+        c["muted"] = muted
+        dev = self._ensure_device()
+        dev.set_input(n - 1, polar=c["polar"], muted=muted,
+                      delay_samples=c["delay"], volume=c["volume"])
+        self.publish(f"in{n}_mute/state", "ON" if muted else "OFF",
+                     retain=True, qos=1)
+
+    def _handle_in_polar(self, topic: str, text: str) -> None:
+        n = self._input_idx_from_topic(topic)
+        polar = text.strip().upper() in ("ON", "TRUE", "1", "YES")
+        c = self._input_misc_cache(n - 1)
+        c["polar"] = polar
+        dev = self._ensure_device()
+        dev.set_input(n - 1, polar=polar, muted=c["muted"],
+                      delay_samples=c["delay"], volume=c["volume"])
+        self.publish(f"in{n}_polar/state", "ON" if polar else "OFF",
+                     retain=True, qos=1)
+
+    def _handle_in_delay(self, topic: str, text: str) -> None:
+        n = self._input_idx_from_topic(topic)
+        try:
+            samples = int(float(text.strip()))
+        except ValueError as e:
+            raise ValueError(f"delay must be an integer, got {text!r}") from e
+        if not 0 <= samples <= 0xFFFF:
+            raise ValueError(f"delay out of u16 range: {samples}")
+        c = self._input_misc_cache(n - 1)
+        c["delay"] = samples
+        dev = self._ensure_device()
+        dev.set_input(n - 1, polar=c["polar"], muted=c["muted"],
+                      delay_samples=samples, volume=c["volume"])
+        self.publish(f"in{n}_delay/state", str(samples), retain=True, qos=1)
+
+    def _handle_in_volume_raw(self, topic: str, text: str) -> None:
+        n = self._input_idx_from_topic(topic)
+        try:
+            vol = int(float(text.strip()))
+        except ValueError as e:
+            raise ValueError(f"volume must be an integer, got {text!r}") from e
+        if not 0 <= vol <= 0xFF:
+            raise ValueError(f"volume out of u8 range: {vol}")
+        c = self._input_misc_cache(n - 1)
+        c["volume"] = vol
+        dev = self._ensure_device()
+        dev.set_input(n - 1, polar=c["polar"], muted=c["muted"],
+                      delay_samples=c["delay"], volume=vol)
+        self.publish(f"in{n}_volume_raw/state", str(vol), retain=True, qos=1)
+
     def _handle_factory_reset(self) -> None:
         """EXPERIMENTAL: trigger the magic-word factory-reset register write.
 
@@ -796,6 +986,74 @@ class DeviceWorker:
                           self.slug, n, e)
                 continue
             self._publish_channel_state(n, state)
+            # Per-channel name surfaces as its own text entity so users
+            # can rename from HA. Live-readback from blob[286..293] —
+            # filter to printable ASCII, strip spaces/nulls.
+            self.publish(f"ch{n}_name/state",
+                         state.get("name", "").rstrip("\x00 "),
+                         retain=True, qos=1)
+
+        # Refresh per-input state. Reads return the 288-byte input blob;
+        # we publish a compact JSON summary plus pull MISC fields out for
+        # individual entities (mute/polar/delay/volume).
+        for ich in range(1, 9):
+            try:
+                blob = bytes(dev.read_input_state(ich - 1))
+            except Exception as e:
+                log.debug("%s: in%d poll-refresh failed: %s",
+                          self.slug, ich, e)
+                continue
+            self._publish_input_state(ich, blob)
+
+    def _publish_input_state(self, n: int, blob: bytes) -> None:
+        """Publish input state: a JSON summary + individual MISC field
+        states (mute/polar/delay/volume) extracted from blob[70..77].
+
+        The 288-byte input blob's full layout isn't completely decoded;
+        we publish what's known and the raw hex tail for advanced users.
+        """
+        if len(blob) < 96:
+            return
+        misc = blob[70:78]
+        # Per leon source: [feedback, polar, mode, mute, delay_le16, vol, spare]
+        feedback = misc[0]
+        polar = bool(misc[1])
+        mode = misc[2]
+        muted = bool(misc[3])
+        delay_samples = misc[4] | (misc[5] << 8)
+        volume = misc[6]
+        # Noisegate at blob[86..93]: [threshold, attack, knee, release, config, ..]
+        nz = blob[86:94]
+        # Update the cache so partial-field writes preserve other fields
+        cache = self._input_misc_cache(n - 1)
+        cache.update(polar=polar, muted=muted, delay=delay_samples, volume=volume)
+        doc = {
+            "summary": (f"{'M ' if muted else ''}vol={volume} "
+                        f"d={delay_samples}{' ⏎' if polar else ''}"),
+            "feedback": feedback,
+            "polar": polar,
+            "mode": mode,
+            "muted": muted,
+            "delay_samples": delay_samples,
+            "delay_ms": round(delay_samples * 1000.0 / 48000.0, 4),
+            "volume_raw": volume,
+            "noisegate": {
+                "threshold": nz[0],
+                "attack": nz[1],
+                "knee": nz[2],
+                "release": nz[3],
+                "config": nz[4],
+            },
+            "blob_tail_hex": blob[78:96].hex(),  # for advanced inspection
+        }
+        self.publish(f"in{n}_state/state", doc, retain=True, qos=1)
+        # Individual MISC entities so HA can wire automations on them
+        self.publish(f"in{n}_mute/state",
+                     "ON" if muted else "OFF", retain=True, qos=1)
+        self.publish(f"in{n}_polar/state",
+                     "ON" if polar else "OFF", retain=True, qos=1)
+        self.publish(f"in{n}_delay/state", str(delay_samples), retain=True, qos=1)
+        self.publish(f"in{n}_volume_raw/state", str(volume), retain=True, qos=1)
 
     def _publish_channel_state(self, n: int, state: dict) -> None:
         """Publish the per-channel JSON state document.

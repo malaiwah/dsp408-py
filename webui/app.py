@@ -373,6 +373,91 @@ def do_rename_preset(new_name: str) -> str:
     return f"renamed preset to {name!r}"
 
 
+# ── Master volume / mute ───────────────────────────────────────────────
+def do_set_master_volume(db: float) -> str:
+    try:
+        SESSION.safe_call(lambda d: d.set_master_volume(float(db)))
+    except Exception as e:
+        return f"error: {e}"
+    return f"master volume → {db:+.1f} dB"
+
+
+def do_set_master_mute(muted: bool) -> str:
+    try:
+        SESSION.safe_call(lambda d: d.set_master_mute(bool(muted)))
+    except Exception as e:
+        return f"error: {e}"
+    return f"master {'MUTED' if muted else 'unmuted'}"
+
+
+def do_read_master() -> tuple[float, bool]:
+    """Return (db, muted) from the device for slider/checkbox sync."""
+    try:
+        db, muted = SESSION.safe_call(lambda d: d.get_master())
+        return float(db), bool(muted)
+    except Exception:
+        return 0.0, False
+
+
+# ── Per-channel name (cmd=0x2400+ch, DataID=36) ───────────────────────
+def do_set_channel_name(channel: int, name: str) -> str:
+    name = (name or "").strip()
+    try:
+        SESSION.safe_call(lambda d: d.set_channel_name(int(channel) - 1, name))
+    except Exception as e:
+        return f"error: {e}"
+    return f"ch{channel} name → {name[:8]!r}"
+
+
+def do_read_channel_summary(channel: int) -> str:
+    """Read one channel and return a one-line summary for the UI."""
+    try:
+        state = SESSION.safe_call(lambda d: d.get_channel(int(channel) - 1))
+    except Exception as e:
+        return f"error: {e}"
+    return (f"name={state.get('name', '')!r}  db={state['db']:+.1f}  "
+            f"muted={state['muted']}  polar={state['polar']}  "
+            f"delay={state['delay']}  spk_type={state['spk_type']:#04x}")
+
+
+# ── Per-input (DataType=3 = MUSIC, cat=0x03) ─────────────────────────
+def do_set_input(input_n: int, muted: bool, polar: bool,
+                 delay_samples: int, volume: int) -> str:
+    """Write the input MISC record (cmd=0x0900+input_ch)."""
+    try:
+        SESSION.safe_call(lambda d: d.set_input(
+            int(input_n) - 1,
+            polar=bool(polar),
+            muted=bool(muted),
+            delay_samples=int(delay_samples),
+            volume=int(volume),
+        ))
+    except Exception as e:
+        return f"error: {e}"
+    return (f"in{input_n}: muted={muted} polar={polar} "
+            f"delay={delay_samples} vol={volume}")
+
+
+def do_read_input_summary(input_n: int) -> str:
+    """Read input state and return a one-line summary."""
+    try:
+        blob = SESSION.safe_call(lambda d: d.read_input_state(int(input_n) - 1))
+    except Exception as e:
+        return f"error: {e}"
+    blob = bytes(blob)
+    if len(blob) < 96:
+        return f"in{input_n}: short blob ({len(blob)} bytes)"
+    misc = blob[70:78]
+    polar = bool(misc[1])
+    muted = bool(misc[3])
+    delay = misc[4] | (misc[5] << 8)
+    volume = misc[6]
+    nz = blob[86:91]
+    return (f"in{input_n}: muted={muted} polar={polar} "
+            f"delay={delay} vol={volume}  noisegate=[t={nz[0]} a={nz[1]} "
+            f"k={nz[2]} r={nz[3]} cfg={nz[4]:#04x}]")
+
+
 # ── Firmware flashing ──────────────────────────────────────────────────
 def do_flash(fw_file) -> str:
     """Flash the selected .bin firmware onto the currently-picked device.
@@ -481,22 +566,59 @@ def build_ui() -> gr.Blocks:
 
         # ── Tabs ──────────────────────────────────────────────────────
         with gr.Tabs():
-            # ── Channels tab (placeholder; needs 0x77NN decode) ───
+            # ── Channels tab — master vol/mute + per-channel name (LIVE),
+            # crossover/EQ still placeholder pending per-control wiring ──
             with gr.Tab("Channels"):
                 gr.Markdown(
-                    "Each output channel has 10-band PEQ + HPF + LPF + "
-                    "level + mute + phase + delay. The UI below is a "
-                    "placeholder — the 296-byte 0x77NN response layout "
-                    "is not yet decoded, so these controls are not live "
-                    "wired yet. Use the **Raw Console** for now."
+                    "**Live controls below: Master volume / mute and "
+                    "per-channel name** (write at cmd=0x2400+ch, lands at "
+                    "blob[286..293]). Crossover + 10-band EQ sliders are "
+                    "still placeholders — use the **Raw Console** tab or "
+                    "the MQTT bridge to drive those today."
                 )
                 with gr.Row():
-                    gr.Slider(
-                        MASTER_VOLUME_MIN, MASTER_VOLUME_MAX, value=-20,
-                        step=1, label="Master volume (dB) — placeholder",
+                    master_vol = gr.Slider(
+                        MASTER_VOLUME_MIN, MASTER_VOLUME_MAX, value=0,
+                        step=1, label="Master volume (dB)",
                     )
+                    master_mute = gr.Checkbox(label="Master mute")
+                    master_log = gr.Textbox(label="result",
+                                            interactive=False, scale=2)
+                    master_read = gr.Button("↻ Read")
+                master_vol.release(fn=do_set_master_volume,
+                                   inputs=master_vol, outputs=master_log)
+                master_mute.change(fn=do_set_master_mute,
+                                   inputs=master_mute, outputs=master_log)
+                master_read.click(fn=do_read_master,
+                                  outputs=[master_vol, master_mute])
                 for ch in range(1, NUM_OUTPUT_CHANNELS + 1):
                     with gr.Accordion(f"CH{ch}", open=(ch == 1)):
+                        # Live controls: name (cmd=0x2400+ch) + readback
+                        with gr.Row():
+                            ch_name = gr.Textbox(
+                                label="Name (8-byte ASCII)",
+                                placeholder="e.g. TWEETER",
+                                max_lines=1,
+                                scale=2,
+                            )
+                            ch_name_btn = gr.Button("Apply name", scale=1)
+                            ch_summary_btn = gr.Button("↻ Read state",
+                                                       scale=1)
+                        ch_summary = gr.Textbox(
+                            label="readback", interactive=False,
+                        )
+                        # Capture loop-var ch via default-arg trick
+                        ch_name_btn.click(
+                            fn=lambda name, _ch=ch: do_set_channel_name(_ch, name),
+                            inputs=ch_name, outputs=ch_summary,
+                        )
+                        ch_summary_btn.click(
+                            fn=lambda _ch=ch: do_read_channel_summary(_ch),
+                            outputs=ch_summary,
+                        )
+                        gr.Markdown(
+                            "_Sliders below are placeholders — not yet wired._"
+                        )
                         with gr.Row():
                             gr.Slider(
                                 CHANNEL_LEVEL_MIN, CHANNEL_LEVEL_MAX, value=0,
@@ -556,6 +678,49 @@ def build_ui() -> gr.Blocks:
                                 elif i == 10:
                                     gr.Radio(BAND10_TYPES, value="PEQ",
                                              label="Type")
+
+            # ── Inputs tab — DataType=3 (cat=0x03) input processing ──
+            # Per leon source + live verification, each of the 4 RCA + 4
+            # high-level inputs has independent gain/mute/polar/delay
+            # before the routing matrix. Wire-verified 2026-04-19.
+            with gr.Tab("Inputs"):
+                gr.Markdown(
+                    "**Input-side processing** (DSP-408 firmware exposes 8 "
+                    "input slots — typically the 4 RCA + 4 high-level + 1 "
+                    "BT, with cells 6+ unused on this hardware revision). "
+                    "Wire writes verified live; field semantics labeled "
+                    "per leon Android source — units uncalibrated."
+                )
+                for ic in range(1, 9):
+                    with gr.Accordion(f"IN{ic}", open=(ic == 1)):
+                        with gr.Row():
+                            in_muted = gr.Checkbox(label="Mute")
+                            in_polar = gr.Checkbox(label="Phase invert (180°)")
+                        with gr.Row():
+                            in_delay = gr.Number(
+                                label="Delay (samples, u16)",
+                                value=0, minimum=0, maximum=0xFFFF, step=1,
+                            )
+                            in_volume = gr.Slider(
+                                0, 255, value=0, step=1,
+                                label="Volume (raw u8)",
+                            )
+                        with gr.Row():
+                            in_apply = gr.Button("Apply", scale=1)
+                            in_read = gr.Button("↻ Read state", scale=1)
+                        in_log = gr.Textbox(
+                            label="result", interactive=False,
+                        )
+                        in_apply.click(
+                            fn=lambda mu, po, d, v, _ic=ic: do_set_input(
+                                _ic, mu, po, d, v),
+                            inputs=[in_muted, in_polar, in_delay, in_volume],
+                            outputs=in_log,
+                        )
+                        in_read.click(
+                            fn=lambda _ic=ic: do_read_input_summary(_ic),
+                            outputs=in_log,
+                        )
 
             # ── Mixer tab (placeholder) ───────────────────────────
             with gr.Tab("Mixer"):

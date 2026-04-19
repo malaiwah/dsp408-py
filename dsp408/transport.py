@@ -119,6 +119,16 @@ class Transport:
             raise ValueError(f"expected {FRAME_SIZE} bytes, got {len(frame64)}")
         self.hid.write(b"\x00" + frame64)
 
+    def send_frames(self, frames: list[bytes]) -> None:
+        """Send a multi-frame logical packet. The first frame has the
+        standard DSP-408 header + first chunk + checksum + end marker;
+        any continuation frames are raw 64-byte HID reports of payload
+        bytes back-to-back. Used by Device.write_raw() for payloads
+        larger than 48 bytes (e.g. set_full_channel_state's 296-byte
+        channel-state writes)."""
+        for f in frames:
+            self.send_frame(f)
+
     # ----- single frame recv -----
     def read_frame(self, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> Frame | None:
         """Read one DSP-408 frame, skipping empty/zero-length reads."""

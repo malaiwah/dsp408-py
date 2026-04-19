@@ -1038,3 +1038,60 @@ def test_load_preset_by_name_writes_padded_name() -> None:
     payload = _last_payload(t)
     assert payload.startswith(b"Bureau")
     assert len(payload) == 16  # 15-byte name slot + 1-byte trailing nul
+
+
+# ── Multi-frame WRITE (transport-level) ──────────────────────────────────
+def test_build_frames_multi_singleframe_passes_through() -> None:
+    """Payload <= 48 bytes goes through the single-frame path."""
+    from dsp408.protocol import build_frame, build_frames_multi
+    data = b"\xAA" * 8
+    frames = build_frames_multi(direction=DIR_WRITE, seq=0, cmd=0x1F00,
+                                 data=data, category=CAT_PARAM)
+    assert len(frames) == 1
+    assert frames[0] == build_frame(direction=DIR_WRITE, seq=0, cmd=0x1F00,
+                                     data=data, category=CAT_PARAM)
+
+
+def test_build_frames_multi_296_byte_matches_captured_gui_bytes() -> None:
+    """Wire pattern matches frames 2019..2027 of
+    captures/load_loaddisk_save_preset_bureau.pcapng exactly."""
+    from dsp408.protocol import build_frames_multi
+    f1 = bytes.fromhex("808080eea10100040000010028011f0058023400000041005802340000007d00580234000000fa00580234000000f401580234000000e803580234000000d007")
+    f2 = bytes.fromhex("580234000000a00f580234000000401f580234000000803e580234000000c800580234000000fa005802340000003b015802340000009001580234000000f401")
+    f3 = bytes.fromhex("58023400000076025802340000002003580234000000e803580234000000e2045802340000004006580234000000d007580234000000c4095802340000004e0c")
+    f4 = bytes.fromhex("580234000000a00f58023400000088135802340000009c18580234000000401f5802340000001027580234000000d430580234000000803e580234000000204e")
+    f5 = bytes.fromhex("580234000000010058020000000164000003204e00036400640000000000a4013800f4010000a4013800f401000220202020202020000aaa0000000000000000")
+    payload = f1[14:64] + f2 + f3 + f4 + f5[:54]
+    frames = build_frames_multi(direction=DIR_WRITE, seq=0, cmd=0x10000,
+                                 data=payload, category=CAT_PARAM)
+    assert frames == [f1, f2, f3, f4, f5], (
+        "multi-frame WRITE bytes must match the captured GUI bytes verbatim")
+
+
+# ── .jssh / .jsah preset file cipher ─────────────────────────────────────
+def test_jssh_round_trip_short() -> None:
+    from dsp408 import jssh
+    plain = b'{"hello": "world", "n": 42}'
+    cipher = jssh.encode(plain)
+    assert cipher != plain  # actually transformed
+    assert jssh.decode(cipher) == plain
+
+
+def test_jssh_round_trip_long() -> None:
+    """Position-XOR per 32 KB page — verify wraparound at PAGE_SIZE."""
+    from dsp408 import jssh
+    plain = bytes(range(256)) * 200  # 51200 bytes — exceeds one PAGE_SIZE
+    cipher = jssh.encode(plain)
+    assert jssh.decode(cipher) == plain
+    # XOR is symmetric
+    assert jssh.encode(cipher) == plain
+
+
+def test_jssh_first_byte_is_unchanged() -> None:
+    """Position 0: byte ^ 0 == byte. First byte should be identical."""
+    from dsp408 import jssh
+    plain = b"\xAA" + b"\x00" * 100
+    cipher = jssh.encode(plain)
+    assert cipher[0] == 0xAA
+    assert cipher[1] == 0x01  # 0 XOR 1
+    assert cipher[2] == 0x02

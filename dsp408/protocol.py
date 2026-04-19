@@ -133,8 +133,100 @@ def build_frame(
     tail = bytes([chk, END_MARKER])
     frame = body + tail
     if len(frame) > FRAME_SIZE:
-        raise ValueError(f"frame too long: {len(frame)} > {FRAME_SIZE}")
+        raise ValueError(
+            f"frame too long: {len(frame)} > {FRAME_SIZE} — payload "
+            f"is {len(data)} bytes; use build_frames_multi() for "
+            f"payloads > {FRAME_SIZE - HEADER_SIZE - 2} bytes"
+        )
     return frame + b"\x00" * (FRAME_SIZE - len(frame))
+
+
+def build_frames_multi(
+    *,
+    direction: int = DIR_CMD,
+    seq: int = 0,
+    cmd: int = 0,
+    data: bytes = b"\x00" * 8,
+    category: int = CAT_STATE,
+) -> list[bytes]:
+    """Build a list of 64-byte HID frames carrying ONE logical DSP-408 frame.
+
+    Single-frame and multi-frame layouts are subtly different — both are
+    extracted from the Windows GUI captures:
+
+    Single-frame (payload ≤ 48 bytes):
+        ``magic(4) | dir | ver | seq | cat | cmd_le32 | len_le16 |
+         payload | xor_chk | END_MARKER | zero-pad``
+        (= 14-byte header + N payload + 2-byte trailer, padded to 64)
+
+    Multi-frame (payload > 48 bytes — e.g. 296-byte channel-state writes
+    the GUI emits for "Load from disk"):
+        First frame: ``magic | header[10] | first_50_bytes_of_payload``
+            (= 14 header + 50 payload, NO checksum, NO end marker)
+        Continuation frames: raw 64-byte chunks of remaining payload.
+        Last continuation frame: payload bytes are followed *in the
+            same HID report* by ``xor_chk | END_MARKER``, then
+            zero-pad to fill the 64-byte HID report.  The XOR
+            checksum covers ``[direction..end_of_payload]`` (header
+            without the 4-byte magic prefix, plus all payload bytes).
+        ``payload_len`` in the header carries the FULL declared length;
+        the firmware reads it and consumes continuation HID reports
+        until the declared count is satisfied, then expects the
+        checksum + end marker immediately after.
+
+    Wire pattern verified against ``captures/load_loaddisk_save_preset_bureau.pcapng``
+    frames 2019..2027 (a 296-byte cmd=0x10000 write). Byte-exact
+    replay of those 5 frames was acked by the device 2026-04-19.
+    """
+    max_in_first_single = FRAME_SIZE - HEADER_SIZE - 2  # 48: room for chk+end
+    if len(data) <= max_in_first_single:
+        return [build_frame(direction=direction, seq=seq, cmd=cmd,
+                            data=data, category=category)]
+    # Multi-frame: first frame has NO chk/end, 50 payload bytes fit.
+    max_in_first_multi = FRAME_SIZE - HEADER_SIZE  # 50
+    full_len = len(data)
+    first_chunk = data[:max_in_first_multi]
+    header = struct.pack(
+        "<4sBBBB I H",
+        FRAME_MAGIC,
+        direction & 0xFF,
+        PROTO_VERSION,
+        seq & 0xFF,
+        category & 0xFF,
+        cmd & 0xFFFFFFFF,
+        full_len & 0xFFFF,  # FULL declared length, not just first chunk
+    )
+    first_frame = header + first_chunk  # exactly 14 + 50 = 64 bytes
+    assert len(first_frame) == FRAME_SIZE, (
+        f"multi-frame first-frame length mismatch: {len(first_frame)}")
+    frames: list[bytes] = [first_frame]
+    # Continuation frames: each is 64 raw bytes of payload. The LAST
+    # continuation frame carries the remaining payload + checksum + end
+    # marker + zero-pad.
+    rest = data[max_in_first_multi:]
+    chk = xor_checksum(bytes(header[4:14]) + bytes(data))
+    while rest:
+        chunk = rest[:FRAME_SIZE]
+        rest = rest[FRAME_SIZE:]
+        if not rest:
+            # LAST continuation: append checksum + end marker + zero-pad
+            tail = bytes([chk, END_MARKER])
+            chunk = chunk + tail
+            if len(chunk) < FRAME_SIZE:
+                chunk = chunk + b"\x00" * (FRAME_SIZE - len(chunk))
+            elif len(chunk) > FRAME_SIZE:
+                # Edge case: chk+end pushed us over — they belong in
+                # an additional all-payload-was-here frame. Spill into
+                # one more frame.
+                spill_payload = chunk[:FRAME_SIZE]
+                frames.append(spill_payload)
+                chunk = bytes([chk, END_MARKER]) + b"\x00" * (FRAME_SIZE - 2)
+        else:
+            # Middle continuation: pure 64-byte payload chunk
+            if len(chunk) < FRAME_SIZE:
+                chunk = chunk + b"\x00" * (FRAME_SIZE - len(chunk))
+        frames.append(chunk)
+    return frames
 
 
 @dataclass
