@@ -42,10 +42,10 @@ sound-template dropdown writes this byte AND cascades crossover/EQ defaults.
 | 252 | 1 | byte_252 | Semantic UNKNOWN. leon called this `eq_mode` but live probe `_probe_eq_mode.py` proved writes here round-trip but do NOT bypass EQ. Round-trips correctly; do not key automations on it. |
 | **253** | **1** | **spk_type** (was "subidx") | **Verified, renamed.** Speaker-role identifier 1..25. |
 | 254–255 | 2 | h_freq_le16 | **Verified live.** HPF cutoff Hz. |
-| 256 | 1 | h_filter | **Verified live.** HPF type: 0=Butterworth, 1=Bessel, 2=Linkwitz-Riley, 3=LR alias. |
+| 256 | 1 | h_filter | **Verified live.** HPF type: 0=Butterworth, 1=Bessel, 2=Linkwitz-Riley, 3=Defeat (bypass, no filter applied). |
 | 257 | 1 | h_level | **Verified live.** HPF slope: 0..7 = 6/12/18/24/30/36/42/48 dB/oct, 8=Off (bypass). |
 | 258–259 | 2 | l_freq_le16 | **Verified live.** LPF cutoff. |
-| 260 | 1 | l_filter | **Verified live.** LPF type. |
+| 260 | 1 | l_filter | **Verified live.** LPF type: 0=Butterworth, 1=Bessel, 2=Linkwitz-Riley, 3=Defeat (bypass). |
 | 261 | 1 | l_level | **Verified live.** LPF slope. |
 | 262–269 | **8** | mixer IN1..IN8 cells | **Verified live.** 8 cells (NOT 16 — leon's IN9..IN16 don't exist in our 4-in firmware). u8 0..255 levels (linear amplitude, allows boost above unity); GUI exposes only 0/100 toggles. |
 | 270–277 | 8 | comp_shadow | **Live-verified UNKNOWN.** Reads identical to the live compressor record but writes via cmd=0x2300+ch land at 278..285, never here. Probable read-only "factory default" shadow. Always reads `[164,1, 56,0, 244,1, 0, 0]` = (Q=420, A=56, R=500, T=0, Lk=0). |
