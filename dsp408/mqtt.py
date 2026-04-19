@@ -557,34 +557,69 @@ class DeviceWorker:
                      "ON" if master_muted else "OFF", retain=True)
 
     def publish_initial_cached_state(self) -> None:
-        """Publish per-channel + routing initial state on startup.
+        """Read device state and publish it as initial MQTT retained values.
 
-        These entities don't have a working device readback (the device
-        returns the EQ filter table for those addresses). So we publish
-        what we (or a previous bridge run via MQTT retained messages)
-        last knew. Defaults: per-channel 0 dB unmuted, routing all OFF.
+        Calls ``get_channel()`` for each of the 8 outputs, which issues a
+        real ``cmd=0x77NN`` USB read and parses the 296-byte blob.  This
+        replaces the old approach of publishing defaults from an
+        in-memory cache, so HA sees the actual device state even after a
+        bridge restart.
 
-        Without this, the HA UI sliders/switches stay blank until the
-        user touches them — confusing if you just opened HA and want to
-        see "where is everything set right now."
+        Routing caveats: the blob parser can only detect a routing row as
+        ON when at least one input is ON (a non-zero level).  If all
+        inputs for an output are OFF the pattern is ambiguous and we fall
+        back to whatever the routing mirror already holds (typically all
+        OFF, which is the device's power-on default).
+
+        Per-channel routing state read from the blob is merged into the
+        worker's ``_routing_mirror`` so subsequent toggle commands work
+        from the correct baseline.
         """
         self._routing_state_init()
-        # Per-channel
         try:
             dev = self._ensure_device()
-            dev._channel_cache_init()
         except Exception as e:
-            log.warning("%s: initial channel publish skipped: %s",
+            log.warning("%s: initial state read skipped (no device): %s",
                         self.slug, e)
             return
+
         for n in range(1, 9):
-            cached = dev.get_channel_cached(n - 1)
+            channel = n - 1
+            try:
+                state = dev.get_channel(channel)
+            except Exception as e:
+                log.warning(
+                    "%s: ch%d state read failed, using cached defaults: %s",
+                    self.slug, n, e,
+                )
+                # Fall back to whatever is in the cache (default: 0 dB, unmuted)
+                cached = dev.get_channel_cached(channel)
+                self.publish(f"ch{n}_volume/state",
+                             f"{cached['db']:g}", retain=True, qos=1)
+                self.publish(f"ch{n}_mute/state",
+                             "ON" if cached["muted"] else "OFF",
+                             retain=True, qos=1)
+                continue
+
+            # Successfully read from device — publish actual state.
             self.publish(f"ch{n}_volume/state",
-                         f"{cached['db']:g}", retain=True, qos=1)
+                         f"{state['db']:g}", retain=True, qos=1)
             self.publish(f"ch{n}_mute/state",
-                         "ON" if cached["muted"] else "OFF",
+                         "ON" if state["muted"] else "OFF",
                          retain=True, qos=1)
-        # Routing matrix
+
+            # Merge routing row into the in-memory mirror so that
+            # subsequent toggle commands build on the correct baseline.
+            # Only update cells where the blob returned a non-ambiguous
+            # (i.e. at least one ON) result; otherwise keep the mirror.
+            routing_row = state.get("routing")
+            if routing_row and any(routing_row):
+                self._routing_mirror[channel] = list(routing_row)
+                log.debug("%s: ch%d routing from device: %s",
+                          self.slug, n, routing_row)
+
+        # Publish the routing matrix state (from mirror, possibly updated
+        # above for channels with at least one ON input).
         for n in range(1, 9):
             for m in range(1, 5):
                 on = self._routing_mirror[n - 1][m - 1]

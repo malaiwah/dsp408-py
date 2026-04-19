@@ -269,3 +269,99 @@ def test_reads_keep_auto_seq() -> None:
     # Read frames should have seq 0, 1, 2 (auto-incremented)
     seqs = [parse_frame(f).seq for f in t.sent]
     assert seqs == [0, 1, 2]
+
+
+# ── channel state blob parser ───────────────────────────────────────────
+def _make_channel_blob(channel: int, db: float, muted: bool,
+                       delay: int = 0,
+                       record_offset: int = 246) -> bytes:
+    """Build a synthetic 296-byte channel-state blob with the write-format
+    record embedded at `record_offset`.
+
+    The write-format record is the same 8-byte payload the device uses:
+        [en, 00, vol_lo, vol_hi, delay_lo, delay_hi, 00, subidx]
+    Everything else in the blob is zeroed.
+    """
+    from dsp408.protocol import (
+        CHANNEL_SUBIDX,
+        CHANNEL_VOL_MAX,
+        CHANNEL_VOL_OFFSET,
+    )
+    blob = bytearray(296)
+    raw_vol = max(0, min(CHANNEL_VOL_MAX,
+                         round(db * 10 + CHANNEL_VOL_OFFSET)))
+    en_bit = 0 if muted else 1
+    si = CHANNEL_SUBIDX[channel]
+    record = bytes([
+        en_bit, 0,
+        raw_vol & 0xFF, (raw_vol >> 8) & 0xFF,
+        delay & 0xFF, (delay >> 8) & 0xFF,
+        0, si,
+    ])
+    blob[record_offset: record_offset + 8] = record
+    return bytes(blob)
+
+
+@pytest.mark.parametrize(
+    "channel,db,muted,delay",
+    [
+        # f19565 t=176.04: CH1 vol back to 0 dB
+        (0, 0.0, False, 0),
+        # f13129 t=124.12: CH1 "volume off" — vol=0 (-60 dB), unmuted
+        (0, -60.0, False, 0),
+        # CH2 at -30 dB, unmuted
+        (1, -30.0, False, 0),
+        # CH1 muted at -60 dB
+        (0, -60.0, True, 0),
+        # CH1 muted, vol=0 dB (raw 600)
+        (0, 0.0, True, 0),
+        # CH4 (channel index 3) at -10 dB, unmuted
+        (3, -10.0, False, 52),
+        # CH7 (channel index 6) at -20 dB, muted
+        (6, -20.0, True, 0),
+        # CH8 (channel index 7) at 0 dB, unmuted
+        (7, 0.0, False, 128),
+    ],
+)
+def test_parse_channel_blob_vol_mute(channel, db, muted, delay) -> None:
+    """parse_channel_state_blob extracts volume and mute correctly."""
+    blob = _make_channel_blob(channel, db, muted, delay)
+    result = Device.parse_channel_state_blob(blob, channel)
+    assert result is not None, "parser returned None"
+    assert abs(result["db"] - db) < 0.1, f"db mismatch: {result['db']} vs {db}"
+    assert result["muted"] == muted
+    assert result["delay"] == delay
+
+
+def test_parse_channel_blob_returns_none_for_bad_blob() -> None:
+    """A blob with no recognisable record returns None."""
+    blob = bytes(296)   # all zeros — no valid en_bit/subidx pattern
+    # channel 0 has subidx=0x01; all-zero blob has no byte == 1 with
+    # the correct constraints, so the parser should return None.
+    result = Device.parse_channel_state_blob(blob, 0)
+    assert result is None
+
+
+def test_parse_channel_blob_all_channels_have_unique_subidx() -> None:
+    """Each channel's subidx is unique enough that the parser selects
+    the right record even when all 8 channels' records are embedded."""
+    from dsp408.protocol import CHANNEL_SUBIDX
+    # Build one big blob that has records for all 8 channels at
+    # staggered offsets (8 bytes apart).
+    blob = bytearray(296)
+    for ch in range(8):
+        raw_vol = (ch + 1) * 50   # 50, 100, 150, ... (all valid)
+        en = 1
+        si = CHANNEL_SUBIDX[ch]
+        rec = bytes([en, 0, raw_vol & 0xFF, (raw_vol >> 8) & 0xFF, 0, 0, 0, si])
+        offset = 8 * ch
+        blob[offset: offset + 8] = rec
+
+    for ch in range(8):
+        result = Device.parse_channel_state_blob(bytes(blob), ch)
+        assert result is not None, f"channel {ch} not found"
+        expected_vol = (ch + 1) * 50
+        expected_db = (expected_vol - 600) / 10.0
+        assert abs(result["db"] - expected_db) < 0.01, (
+            f"ch {ch}: db={result['db']} expected {expected_db}"
+        )

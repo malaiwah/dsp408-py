@@ -505,11 +505,15 @@ class Device:
     def read_channel_state(self, channel: int) -> bytes:
         """Read the full state of output channel N (0..7) — 296 bytes.
 
-        Layout is not yet decoded. Known prefix from one capture:
+        Layout is partially decoded.  Known prefix from one capture:
             28 01 1f 00 | 58 02 34 00 00 00 | 41 00 ...
-        The capture header encodes (40+1, 31, 0) as LE u16 — possibly a
-        structure size/version/count triplet — but this is unconfirmed.
-        Use the raw bytes and decode live on the Pi.
+        where bytes[4:6] as LE16 = 600 (volume at 0 dB), bytes[6:8] as
+        LE16 = 52 (delay in samples).
+
+        The blob also embeds the 8-byte write-format channel record at
+        offset ~246:
+            [en, 00, vol_lo, vol_hi, delay_lo, delay_hi, 00, subidx]
+        Use `parse_channel_state_blob()` to extract that record.
         """
         if not 0 <= channel <= 7:
             raise ValueError(f"channel must be in 0..7, got {channel}")
@@ -520,6 +524,98 @@ class Device:
         cmd = (CMD_READ_CHANNEL_BASE << 8) | channel    # 0x7700, 0x7701, …
         reply = self.read_raw(cmd=cmd, category=CAT_PARAM, timeout_ms=3000)
         return reply.payload
+
+    @staticmethod
+    def parse_channel_state_blob(blob: bytes, channel: int) -> dict | None:
+        """Extract volume, mute, and delay from a 296-byte channel blob.
+
+        The blob returned by cmd=0x77NN (read_channel_state) embeds the
+        channel's write-format record ``[en, 00, vol_lo, vol_hi, dly_lo,
+        dly_hi, 00, subidx]`` at some offset (typically near byte 246).
+        This method locates that record by scanning the blob from the
+        RIGHT (highest offset first), searching for the known ``subidx``
+        byte for ``channel`` while validating the surrounding fields.
+
+        Why right-to-left: the subidx for channel 0 is 0x01, which also
+        equals a valid ``en_bit`` value.  Scanning from the right means
+        we find the real record (near offset 246, where the subidx sits
+        at position +7 within the record) before reaching the spurious
+        early match (further left, where an ``en_bit=0x01`` byte could
+        appear seven positions to the left of a zero run that satisfies
+        all other constraints).
+
+        Note on routing: the routing row for this output is also stored
+        in the blob, but cannot be reliably parsed without knowing its
+        exact byte offset — the pattern ``[x, x, x, x, 0, 0, 0, 0]``
+        (x ∈ {0x00, 0x64}) is too ambiguous against incidental zero runs.
+        Routing state should be tracked in-memory (see
+        :meth:`set_routing` and ``DeviceWorker._routing_mirror``).
+
+        Returns:
+            dict with keys ``db`` (float), ``muted`` (bool), and
+            ``delay`` (int samples), or None if the record cannot be
+            found in the blob.
+        """
+        if not 0 <= channel <= 7:
+            raise ValueError(f"channel must be in 0..7, got {channel}")
+        if len(blob) < 8:
+            return None
+
+        target_subidx = CHANNEL_SUBIDX[channel]
+
+        # Scan right-to-left so the real record is found first.
+        for i in range(len(blob) - 8, -1, -1):
+            if blob[i + 7] != target_subidx:
+                continue
+            if blob[i + 6] != 0x00:
+                continue
+            if blob[i] not in (0, 1):
+                continue
+            if blob[i + 1] != 0x00:
+                continue
+            cand_vol = int.from_bytes(blob[i + 2: i + 4], "little")
+            if not (0 <= cand_vol <= CHANNEL_VOL_MAX):
+                continue
+            # All constraints satisfied.
+            en_bit = blob[i]
+            raw_vol = cand_vol
+            raw_delay = int.from_bytes(blob[i + 4: i + 6], "little")
+            db = (raw_vol - CHANNEL_VOL_OFFSET) / 10.0
+            muted = (en_bit == 0)
+            return {"db": db, "muted": muted, "delay": raw_delay}
+
+        return None
+
+    def get_channel(self, channel: int) -> dict:
+        """Read per-channel state from the device and return it.
+
+        Issues a ``cmd=0x77NN`` read, parses the 296-byte blob to extract
+        volume, mute, and delay, updates the in-memory cache, and returns
+        a dict with keys: ``db`` (float), ``muted`` (bool),
+        ``delay`` (int).
+
+        If the blob cannot be parsed (e.g. an unexpected firmware version
+        changes the layout), returns the cached defaults and logs a
+        warning so the caller can still proceed gracefully.
+        """
+        self._channel_cache_init()
+        blob = self.read_channel_state(channel)
+        result = self.parse_channel_state_blob(blob, channel)
+        if result is None:
+            import logging
+            logging.getLogger("dsp408.device").warning(
+                "get_channel(%d): could not parse 296-byte blob — "
+                "using cached defaults. First 16 bytes: %s",
+                channel, blob[:16].hex() if blob else "(empty)",
+            )
+            return dict(self._channel_cache[channel])
+
+        self._channel_cache[channel] = {
+            "db": result["db"],
+            "muted": result["muted"],
+            "delay": result["delay"],
+        }
+        return result
 
     def write_channel_param(
         self,
