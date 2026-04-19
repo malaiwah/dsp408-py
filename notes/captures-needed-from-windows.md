@@ -54,43 +54,52 @@ via `read_channel_state()`, confirm it matches.
 
 ---
 
-## 2. Factory reset  (high value, blocked entirely)
+## 2. Factory reset  (wire-decoded ✓ — behavior partially mysterious)
 
-**What we don't know:** the wire encoding for the magic-word system register
-write that triggers a full factory reset.  The leon Android decompile
-(see `notes/android-app-decompile-2026-04-19.md`) shows the Android app
-writing magic `0xA5A6` to register address `1567` (`0x061F`), but our
-live probes against this encoding all failed (one variant *corrupted ch7
-EQ data*, see the cautionary block in `dsp408/device.py::factory_reset`).
-**That implementation is the known-broken stub today.**
+**What we have:** `captures/reset_to_defaults.pcapng` showed the GUI
+emits exactly four writes when the user clicks "Reset to Defaults":
+  1.  `cmd=0x00  cat=0x09  data="Custom\0\0\0\0\0\0\0\0\0\0"` — preset-name write
+  2.  `cmd=0x2000 cat=0x04 data=06 1f 00 00 20 4e 00 01` — **THE magic write**
+  3.  `cmd=0x00  cat=0x09  data="Custom\0..."` — preset-name write again
+  4.  `cmd=0x00  cat=0x09  data="Custom\0..."` — and a third time
 
-**Repro steps:**
-1.  Connect, let handshake settle.
-2.  Make a few visible changes first so we can see "reset took": set
-    master to -10 dB, mute ch1, change crossover on ch2 to BW 24 dB/oct
-    @ 200 Hz / 8 kHz.  Confirm in the GUI those changed.
-3.  Pause ~2 s.
-4.  Start capture.
-5.  In the GUI, click "Factory Reset" (or whatever it's labelled in
-    V1.24 — usually a button in the Tools / System menu).  Confirm the
-    confirmation dialog.
-6.  Wait ~3 s for the device to settle.
-7.  Stop capture.
+The 8-byte magic looks structurally like `[register_le16][pad_le16][value_u32]`:
+  - `06 1f` → register `0x1F06` LE (= `0x061F` BE = 1567, matching leon's
+    register-1567 claim)
+  - `00 00` pad
+  - `20 4e 00 01` → value `0x01004E20` LE
 
-**What to look for:**
-- A unique WRITE frame (`dir=a1`) right around the click — should be a
-  one-shot, not a sequence.  Likely cat=`0x09` (state cmd).
-- The cmd code may be `0x061F` (the leon register address) or could be a
-  totally different cmd code in our HID protocol with the magic value in
-  payload.  The Android app talks UART, not USB — the encoding could
-  have been remapped.
-- Compare against the post-reset 0x77NN reads: every channel should now
-  show factory defaults (mute=audible, gain=0 dB, EQ flat, crossover
-  20 Hz / 20 kHz BW 12 dB).
+The magic frame's ack arrives ~430 ms after the request (vs ~10 ms for
+normal writes) — the firmware is doing real work, not silently dropping it.
 
-**Validation plan once decoded:** rig optional — read all 8 channel
-state blobs before/after to confirm reset took.  Audio loopback also
-useful as a smoke test (everything should pass through cleanly afterward).
+**What we DON'T know yet:** whether the magic actually wipes live state.
+Replaying the captured 4-write sequence through `Device.factory_reset()`
+on the rig (2026-04-19):
+  * The preset name DID change to "Custom" reliably.
+  * **Per-channel state read back via** `read_channel_state()` **right
+    after the magic was UNCHANGED** — master volume, channel volume/
+    mute/delay/polar, mixer routing, EQ band gains, compressor params
+    all stayed at whatever the user had set.
+
+That's the opposite of what the action's name implies.  Possibilities:
+  1.  The reset only persists to flash and takes effect on the next
+      power cycle — would need to unplug + replug to confirm.
+  2.  It resets a subsystem we don't currently read back (e.g. some
+      "boot defaults" register that only matters at the next boot).
+  3.  The GUI in the captured session may have been on an
+      already-defaulted device — we'd see no change because there was
+      nothing to change.
+
+**Next capture needed:** a "modify-then-reset-then-read" sequence —
+same `reset_to_defaults` capture procedure but with a few visible
+changes made first (master to -20 dB, EQ band 5 to +6 dB on ch1, etc.)
+that we can clearly see in the post-reset 0x77NN reads.  Then we'll
+know whether the magic actually wipes live state.
+
+**Even-more-useful capture:** after the reset, *reconnect* the GUI
+(disconnect / reconnect, or close / reopen the app) so it re-reads
+channel state from the device — that's the test of whether the reset
+persisted.  Compare those 0x77NN reads against pre-modification reads.
 
 ---
 
