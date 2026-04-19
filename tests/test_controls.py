@@ -527,8 +527,8 @@ def test_parse_channel_blob_decodes_extended_fields() -> None:
         FILTER_TYPE_LR,
         OFF_ALL_PASS_Q,
         OFF_ATTACK_MS,
+        OFF_BYTE_252,
         OFF_DELAY,
-        OFF_EQ_MODE,
         OFF_GAIN,
         OFF_HPF_FILTER,
         OFF_HPF_FREQ,
@@ -550,7 +550,7 @@ def test_parse_channel_blob_decodes_extended_fields() -> None:
     blob[OFF_POLAR] = 1                       # phase inverted
     blob[OFF_GAIN:OFF_GAIN + 2] = (480).to_bytes(2, "little")    # -12 dB
     blob[OFF_DELAY:OFF_DELAY + 2] = (52).to_bytes(2, "little")   # 52 samples
-    blob[OFF_EQ_MODE] = 1                     # EQ on
+    blob[OFF_BYTE_252] = 1                    # blob[252] — semantic unknown
     blob[OFF_SPK_TYPE] = CHANNEL_SUBIDX[3]    # 0x07 = fr_low
     blob[OFF_HPF_FREQ:OFF_HPF_FREQ + 2] = (80).to_bytes(2, "little")
     blob[OFF_HPF_FILTER] = FILTER_TYPE_LR     # Linkwitz-Riley
@@ -575,7 +575,7 @@ def test_parse_channel_blob_decodes_extended_fields() -> None:
     assert result["subidx"] == 0x07
     # new fields
     assert result["polar"] is True
-    assert result["eq_mode"] == 1
+    assert result["byte_252"] == 1
     assert result["spk_type"] == 0x07
     assert result["hpf"] == {"freq": 80, "filter": FILTER_TYPE_LR, "slope": 3}
     assert result["lpf"] == {

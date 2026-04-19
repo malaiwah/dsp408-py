@@ -24,9 +24,14 @@ Two things this stack does that the Windows app does *not*:
 | MQTT + HA discovery| **Working** — one device-based config per DSP-408    |
 | Master volume + mute | **Working** — `cmd=0x0005 cat=0x09`; -60..+6 dB    |
 | Per-channel volume + mute | **Working** — `cmd=0x1f0X cat=0x04`; -60..0 dB |
-| Mixer 4×8 routing  | **Working** — `cmd=0x21XX cat=0x04`                  |
-| EQ bands / phase / delay | Decoded in capture; high-level API not yet exposed |
-| Channel state read (`0x77NN`) | **Raw bytes only** — layout still TBD    |
+| Per-channel delay  | **Working** — sample-accurate, capped at 359 taps    |
+| Per-channel phase invert | **Working** — verified ±180° via Scarlett loopback |
+| Routing matrix 8×4 | **Working** — `cmd=0x21XX cat=0x04`; u8 0..255 levels |
+| Crossover (HPF + LPF) | **Working** — `cmd=0x1200X cat=0x04`; types BW/Bessel/LR, slopes 6..48 dB/oct + bypass |
+| 10-band parametric EQ | **Working** — `cmd=0x10X0Y cat=0x04`; q + gain per band (Q≈256/b4) |
+| Compressor write   | **Skeleton** — cmd `0x230X` decoded but not yet driven through full curve fit |
+| Channel state read (`0x77NN`) | **Working** — full 296-byte blob parsed     |
+| Live VU meters     | **Pending** — both READ candidates (`cmd=0x13`, `cmd=0x03`) static; needs Windows capture with audio playing |
 | Gradio web UI      | Device picker + raw console + firmware flash; typed widgets are placeholders |
 
 ## Install
@@ -156,18 +161,24 @@ HA 2024.12+ device-based format).
 | Firmware identity   | sensor     | read-only | e.g. `MYDW-AV1.06`; `diagnostic`           |
 | Preset name         | text       | r/w       | rename the active preset (≤15 chars)       |
 | Status byte         | sensor     | read-only | numeric; `diagnostic`                      |
-| State 0x13          | sensor     | read-only | hex blob; `diagnostic`                     |
+| State 0x13          | sensor     | read-only | 10-byte hex blob (semantics unknown); `diagnostic` |
 | Global 0x06         | sensor     | read-only | hex blob; `diagnostic`                     |
 | **Master volume**   | number     | **r/w**   | slider, -60..+6 dB (1 dB step)             |
 | **Master mute**     | switch     | **r/w**   | ON = muted                                 |
-| **Channel N volume** (×8) | number | **write** | slider, -60..0 dB (0.5 dB step)        |
-| **Channel N mute** (×8)   | switch | **write** | ON = muted                              |
-| **Out N ← In M** routing (×32) | switch | **write** | input-routing matrix; `config` |
+| **Channel N volume** (×8) | number | **r/w**  | slider, -60..0 dB (0.5 dB step), reads from blob |
+| **Channel N mute** (×8)   | switch | **r/w**  | ON = muted                                |
+| **Channel N polar** (×8)  | switch | **r/w**  | phase invert (180°)                       |
+| **Channel N delay** (×8)  | number | **r/w**  | samples (0..359 taps; ~8.14 ms @ 44.1 kHz) |
+| **Channel N state** (×8)  | sensor (JSON) | r/w  | one diagnostic JSON per channel: crossover, mixer, compressor, link group, channel name |
+| **Out N ← In M** routing (×32) | switch + number | **r/w** | input-routing matrix; bool ON/OFF + numeric level (0..255) per cell; `config` |
+| **Factory reset / Load preset** | button | **write** | ⚠ **KNOWN-BROKEN** — magic-word stub, wire encoding still unverified |
 
-Per-channel volume / mute and routing entities are **write-only**: the
-device's read path returns the EQ filter table at the same address, so
-the bridge mirrors what HA wrote rather than polling. Master volume +
-mute have a working readback and are polled every cycle.
+Per-channel state is now read from the 296-byte channel blob both at
+startup and on every poll, so HA stays in sync even after restarts or
+out-of-band changes from the official GUI. EQ-band, crossover, and
+compressor *write* APIs exist in :mod:`dsp408.device` but are not yet
+mapped to HA entities (would explode the entity count); reach them
+from HA via the `raw/write` topic.
 
 **Routing matrix layout:** the DSP-408 boots with all 32 routing cells
 OFF (no audio path). To get audio flowing, toggle the relevant
@@ -295,7 +306,15 @@ git checkout reverse-engineering
 
 ## Hardware facts (from the manual, for reference)
 
-4 RCA + 4 high-level inputs, 8 RCA outputs, 10-band PEQ per output,
-HPF + LPF per output (Linkwitz-Riley / Bessel / Butterworth, slopes
-6/12/18/24 dB/oct, 20 Hz – 20 kHz), per-channel delay up to 8.1471 ms
-(277 cm), 6 presets, master volume, 4×8 input→output mixer.
+4 RCA + 4 high-level inputs, 8 RCA outputs, 10-band PEQ per output (all
+peaking — the manual's mention of LS/HS shelves on bands 1 & 10 is not
+present in the wire format), HPF + LPF per output (Linkwitz-Riley /
+Bessel / Butterworth — firmware also accepts a 4th filter-type byte
+that aliases LR; slopes 6/12/18/24 dB/oct per the manual but firmware
+accepts 6..48 + bypass; 20 Hz – 20 kHz), per-channel delay up to
+8.1471 ms (277 cm) @ 44.1 kHz / 7.48 ms @ 48 kHz, 6 presets, master
+volume, 4×8 input→output mixer (cells take u8 0..255 levels — the GUI
+exposes only on/off but the firmware accepts the full range).
+
+Note: the DSP-408 is **HID-only** — it does NOT enumerate as a USB
+Audio Class device. Audio I/O happens entirely on the analog jacks.

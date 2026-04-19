@@ -213,7 +213,10 @@ CMD_CONNECT = 0xCC              # first packet; ack=1 byte 0x00
 CMD_IDLE_POLL = 0x03            # app spams this every ~30 ms; returns preset name
 CMD_GET_INFO = 0x04             # returns "MYDW-AV1.06" (device identity)
 CMD_PRESET_NAME = 0x00          # read: returns 15-byte name; write(a1): set name
-CMD_STATE_0x13 = 0x13           # returns 10 bytes, meaning unknown (levels?)
+CMD_STATE_0x13 = 0x13           # returns 10 bytes; meaning unknown — empirical
+                                # probe (tests/loopback/_probe_state13.py) found
+                                # the bytes are completely static across audio
+                                # level / mute sweeps, so it's NOT a meter cmd.
 CMD_STATUS = 0x34               # returns 1 byte (0x00 = idle)
 CMD_GLOBAL_0x02 = 0x02          # returns 8 bytes: 01 00 01 00 00 00 00 00
 CMD_GLOBAL_0x05 = 0x05          # returns 8 bytes: 28 00 00 32 00 32 01 00
@@ -226,7 +229,10 @@ CMD_FW_BLOCK = 0x38             # 48 bytes of firmware per packet
 CMD_FW_APPLY = 0x39             # 1 byte 0x13; applies and reboots
 
 # Parameter commands (byte[7] = 0x04)
-# Channel-level reads: 0x7700 + channel_index (0..7), returns 296 bytes
+# Channel-level reads: cmd = (0x77 << 8) | channel_index (0..7), returns
+# 296 bytes. The constant below is just the 0x77 nibble that gets shifted
+# into the high byte by `device.read_channel_state()` — see that method
+# for the actual cmd-build expression.
 CMD_READ_CHANNEL_BASE = 0x0077
 # Channel-level writes (0x1f00..0x1f07, one cmd per output channel).
 # Payload is 8 bytes:
@@ -263,7 +269,19 @@ CMD_ROUTING_BASE = 0x2100
 # Same cmd code as CMD_GLOBAL_0x05; alias for self-documenting call sites.
 CMD_MASTER = 0x0005
 
-CMD_WRITE_GLOBAL = 0x2000       # writes global params (layout TBD)
+CMD_WRITE_GLOBAL = 0x2000       # writes global params (layout TBD; observed
+                                # but never decoded — kept for completeness)
+
+# Per-channel compressor write (0x2300..0x2307 = ch1..ch8). 8-byte payload
+# observed once in captures/windows-04b-volumes-mute-presets.pcapng:
+#     [0..1]  all_pass_q_le16   (mirrors blob[270..271])
+#     [2..3]  attack_ms_le16    (mirrors blob[272..273])
+#     [4..5]  release_ms_le16   (mirrors blob[274..275])
+#     [6]     threshold         (mirrors blob[276])
+#     [7]     enable            (1 = compressor on, 0 = bypass — guess)
+# NOT yet driven by the high-level API; live activation/curve fit still
+# pending (compressor probe is still on the loopback-rig backlog).
+CMD_WRITE_COMPRESSOR_BASE = 0x2300
 
 # Per-channel HPF + LPF crossover writes (0x12000..0x12007 = ch1..ch8).
 # 8-byte payload mirrors blob[254..261] exactly:
@@ -328,6 +346,13 @@ CHANNEL_VOL_MIN = 0      # raw = -60 dB
 CHANNEL_VOL_MAX = 600    # raw = 0 dB (unity)
 CHANNEL_VOL_OFFSET = 600  # raw = (dB * 10) + 600
 
+# Per-EQ-band gain range. Same encoding as channel volume (raw = dB*10 + 600)
+# but EQ bands are allowed to BOOST as well as cut, so the upper cap is
+# higher than CHANNEL_VOL_MAX. Live-verified at +12 dB / -60 dB only;
+# the +60 dB ceiling is the protocol envelope, not a calibrated maximum.
+EQ_GAIN_RAW_MIN  = 0      # = -60 dB
+EQ_GAIN_RAW_MAX  = 1200   # = +60 dB (envelope; only +12 dB verified live)
+
 # Subidx for each of the 8 channel write cmds. Order matches cmd index 0..7.
 # These are also the *spk_type* (speaker-role) values stored at blob[253] of
 # the per-channel state — confirmed by cross-reference with the official
@@ -345,11 +370,12 @@ ROUTING_OFF = 0x00
 # the reverse-engineering branch). The full blob is 296 bytes; offsets 0..245
 # carry the parametric-EQ region (see below).
 #
-# IMPORTANT: leon's app expects 31 EQ bands (248 bytes). Our firmware variant
-# has the basic record at offset 246 instead of 248 — a 2-byte shift implying
-# 30 EQ bands (240 bytes) plus 6 bytes of header/padding before the basic
-# record. EQ count + stride still need confirmation via a Windows-USB
-# capture of single-band tweaks.
+# EQ region: bands 0..9 occupy offsets 0..79 (10 bands × 8 bytes), with
+# the remaining bytes 80..245 holding leon-style padding / unused band
+# slots. Live probe (tests/loopback/_probe_eq_extra_bands.py) confirmed
+# that writes to band indices 10..30 are silently no-ops on this
+# firmware: only 10 bands are functional even though the leon decompile
+# showed 31 addressable slots.
 BLOB_SIZE = 296
 
 # Basic per-channel record (8 bytes at 246..253) — also the write payload format
@@ -360,7 +386,16 @@ OFF_GAIN        = 248  # u16 LE; raw = (dB * 10) + 600; range 0..600 = -60..0 dB
 OFF_DELAY       = 250  # u16 LE; samples — exact 1:1, capped at 359 (firmware
                        # clamps; matches 8.14 ms @ 44.1 kHz, 7.48 ms @ 48 kHz).
                        # Empirical: tests/loopback/test_delay_calibration.py
-OFF_EQ_MODE     = 252  # EQ enable/bypass flag
+OFF_BYTE_252    = 252  # Semantic unknown. Initially hypothesized to be the
+                       # EQ enable/bypass flag (per the leon decompile's
+                       # ``eq_mode`` field name) but live probe
+                       # ``tests/loopback/_probe_eq_mode.py`` proved that
+                       # writes to byte[6] of the channel write payload
+                       # round-trip to blob[252] yet do NOT bypass EQ.
+                       # Kept exposed under a neutral name; do NOT key
+                       # automations on it.
+OFF_EQ_MODE     = OFF_BYTE_252  # DEPRECATED alias — will be removed; the
+                                # name is misleading (see OFF_BYTE_252).
 OFF_SPK_TYPE    = 253  # speaker-role index; one of CHANNEL_SUBIDX by default
 
 # Crossover (HPF + LPF) — 8 bytes at 254..261
@@ -376,15 +411,30 @@ OFF_LPF_SLOPE   = 261
 OFF_MIXER       = 262
 MIXER_CELLS     = 8
 
-# Compressor / dynamics + link group — 8 bytes at 270..277
-OFF_ALL_PASS_Q  = 270  # u16 LE
-OFF_ATTACK_MS   = 272  # u16 LE
-OFF_RELEASE_MS  = 274  # u16 LE
-OFF_THRESHOLD   = 276  # u8 (encoding TBD; likely dB-scaled)
-OFF_LINKGROUP   = 277  # u8 channel link/group index (0 = no link)
+# 8 bytes at 270..277 — semantic UNKNOWN. Reads identical to the
+# compressor record (270..277 always holds Q=420, attack=56, release=500,
+# threshold=0, linkgroup=0 — i.e. the firmware compressor defaults), but
+# **writes to it via cmd=0x2300+ch land at 278..285, not here**, and we
+# never see this region change in any read. Best guess: a read-only
+# "factory default" shadow / pre-init mirror used by the GUI's "Reset
+# Compressor" button. Offsets verified live 2026-04-19 via distinctive
+# byte injection — see the live smoke test in commit log.
+OFF_COMP_SHADOW = 270  # 8 bytes; do not interpret as live compressor
 
-# Per-channel name — 8 bytes ASCII at 278..285
-OFF_NAME        = 278
+# Compressor / dynamics + link group — 8 bytes at 278..285 (LIVE; the
+# location that cmd=0x2300+ch writes to and reads from).
+OFF_ALL_PASS_Q  = 278  # u16 LE
+OFF_ATTACK_MS   = 280  # u16 LE
+OFF_RELEASE_MS  = 282  # u16 LE
+OFF_THRESHOLD   = 284  # u8 (encoding TBD; likely dB-scaled)
+OFF_LINKGROUP   = 285  # u8 channel link/group index (0 = no link)
+
+# Per-channel name — 8 bytes ASCII at 286..293 (default: 8 × 0x20 spaces +
+# 0x00 trailing). Verified live 2026-04-19 via blob dump; previous
+# protocol.py had this at 278 which actually overlapped the live
+# compressor record (the misalignment was hidden by both regions
+# defaulting to identical "all spaces / zero" patterns).
+OFF_NAME        = 286
 NAME_LEN        = 8
 
 # Filter type / slope enums (for select-style controls in MQTT discovery).
@@ -392,6 +442,8 @@ FILTER_TYPE_BW = 0
 FILTER_TYPE_BESSEL = 1
 FILTER_TYPE_LR = 2
 FILTER_TYPE_NAMES = ("Butterworth", "Bessel", "Linkwitz-Riley")
+# Filter-type byte 3 also produces a Linkwitz-Riley response (alias of
+# type 2); see tests/loopback/test_crossover_characterization.py.
 
 # Slope enum: index → "6 dB/oct" / "12 dB/oct" / ... / "Off"
 SLOPE_NAMES = (
@@ -474,6 +526,7 @@ __all__ = [
     "CMD_READ_CHANNEL_BASE",
     "CMD_WRITE_CHANNEL_BASE",
     "CMD_WRITE_GLOBAL",
+    "CMD_WRITE_COMPRESSOR_BASE",
     "CMD_WRITE_CROSSOVER_BASE",
     "CMD_WRITE_EQ_BAND_BASE",
     "EQ_BAND_COUNT",
@@ -487,16 +540,19 @@ __all__ = [
     "CHANNEL_VOL_MIN",
     "CHANNEL_VOL_MAX",
     "CHANNEL_VOL_OFFSET",
+    "EQ_GAIN_RAW_MIN",
+    "EQ_GAIN_RAW_MAX",
     "CHANNEL_SUBIDX",
     "ROUTING_ON",
     "ROUTING_OFF",
     # blob layout
     "BLOB_SIZE",
     "OFF_MUTE", "OFF_POLAR", "OFF_GAIN", "OFF_DELAY",
-    "OFF_EQ_MODE", "OFF_SPK_TYPE",
+    "OFF_BYTE_252", "OFF_EQ_MODE", "OFF_SPK_TYPE",
     "OFF_HPF_FREQ", "OFF_HPF_FILTER", "OFF_HPF_SLOPE",
     "OFF_LPF_FREQ", "OFF_LPF_FILTER", "OFF_LPF_SLOPE",
     "OFF_MIXER", "MIXER_CELLS",
+    "OFF_COMP_SHADOW",
     "OFF_ALL_PASS_Q", "OFF_ATTACK_MS", "OFF_RELEASE_MS",
     "OFF_THRESHOLD", "OFF_LINKGROUP",
     "OFF_NAME", "NAME_LEN",

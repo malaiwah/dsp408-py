@@ -20,21 +20,30 @@ Usage:
 
 Scope note — what's implemented vs. TBD:
 
-    Implemented (verified live in Windows captures):
-      * connect(), get_info(), read_preset_name(), read_state_0x13(),
-        read_status(), read_globals() (cmds 0x02 / 0x05 / 0x06)
-      * read_channel_state(0..7)  — returns 296 raw bytes per channel
-      * read_raw() / write_raw() escape hatches
-      * Sequence counter that increments with every exchange
+    Implemented (verified live on hardware via the Scarlett loopback rig
+    in tests/loopback/ and/or against Windows USBPcap captures):
+      * connect(), get_info(), read_preset_name(), read_status(),
+        read_globals() (cmds 0x02 / 0x05 / 0x06), read_channel_state(0..7)
+        + parse_channel_state_blob()
+      * Master volume / mute (set_master*, get_master)
+      * Per-channel volume / mute / delay / phase invert (set_channel)
+      * Routing matrix (8x4 u8 cells) — set_routing / set_routing_cell
+      * Crossover HPF + LPF — set_crossover (filter type + slope, 6..48
+        dB/oct + bypass)
+      * 10-band parametric EQ — set_eq_band (q OR bandwidth_byte)
+      * Magic-word system register stubs — factory_reset / load_preset
+        (KNOWN-BROKEN: wire encoding still unverified — see method docs)
       * Multi-device enumeration + selection (serial / index / path)
+      * read_raw() / write_raw() escape hatches
 
-    TBD (need live round-trip on the Pi to decode):
-      * Parsing 0x77NN 296-byte channel state into EqBand / Crossover /
-        Delay / Level typed fields
-      * 0x1fNN sub-index → parameter name table (volume, mute, delay, …)
-      * Mixer matrix read/write
-      * Preset save/load/delete by slot
-      * Streaming on/off toggle
+    Known unknowns (decode pending — see /tmp/dsp408-re/notes/
+    captures-needed-from-windows.md on the reverse-engineering branch):
+      * Live VU meters (cmd=0x13 and idle-poll cmd=0x03 both proved
+        static; meter cmd unknown — capture #8 needed)
+      * Per-channel name (set / encoding — capture #1 needed)
+      * Compressor write API (cmd=0x2300+ch decoded but never driven
+        end-to-end on the rig — see set_compressor())
+      * Preset save/load/delete by slot (capture #3 needed)
 """
 from __future__ import annotations
 
@@ -51,6 +60,8 @@ from .protocol import (
     CHANNEL_VOL_MAX,
     CHANNEL_VOL_MIN,
     CHANNEL_VOL_OFFSET,
+    EQ_GAIN_RAW_MAX,
+    EQ_GAIN_RAW_MIN,
     CMD_CONNECT,
     CMD_GET_INFO,
     CMD_IDLE_POLL,
@@ -60,6 +71,7 @@ from .protocol import (
     CMD_ROUTING_BASE,
     CMD_STATUS,
     CMD_WRITE_CHANNEL_BASE,
+    CMD_WRITE_COMPRESSOR_BASE,
     CMD_WRITE_CROSSOVER_BASE,
     CMD_WRITE_EQ_BAND_BASE,
     EQ_BAND_COUNT,
@@ -77,7 +89,7 @@ from .protocol import (
     OFF_ALL_PASS_Q,
     OFF_ATTACK_MS,
     OFF_DELAY,
-    OFF_EQ_MODE,
+    OFF_BYTE_252,
     OFF_GAIN,
     OFF_HPF_FILTER,
     OFF_HPF_FREQ,
@@ -559,19 +571,23 @@ class Device:
         firmware's per-channel struct in RAM.  Field offsets in the second
         half (246..285) were confirmed live on real DSP-408 hardware and
         align with the official Android leon v1.23 app's
-        ``DataStruct_Output`` layout shifted by 2 bytes (our firmware variant
-        appears to carry 30 EQ bands, not 31, in the leading region).
+        ``DataStruct_Output`` layout shifted by 2 bytes.
 
         Layout (verified offsets — see protocol.py for symbolic names):
 
         .. code-block:: text
 
-            0..245   parametric-EQ region (30 bands × 8 bytes? — TBD)
+            0..79    parametric-EQ bands 0..9 (10 × 8-byte records)
+            80..245  unused / leon-style padding for the bands the GUI
+                     never exposes (writes to bands 10..30 silently no-op)
             246      mute       1=audible, 0=muted (NOTE: inverted vs leon)
             247      polar      0=normal, 1=phase-inverted (180°)
             248-249  gain_le16  raw = (dB×10)+600; range 0..600 = -60..0 dB
             250-251  delay_le16 samples (or cm-step index)
-            252      eq_mode    EQ enable/bypass byte
+            252      byte_252   semantic unknown — leon called it `eq_mode`
+                                but live probe proved writes here do NOT
+                                bypass EQ. Round-trips correctly; do not
+                                key automations on it.
             253      spk_type   speaker-role index; default in CHANNEL_SUBIDX
             254-255  hpf_freq_le16
             256      hpf_filter (0=BW, 1=Bessel, 2=LR)
@@ -580,16 +596,21 @@ class Device:
             260      lpf_filter
             261      lpf_slope
             262-269  mixer IN1..IN8 (8 × u8 percentage)
-            270-271  all_pass_q_le16
-            272-273  attack_ms_le16   (compressor attack)
-            274-275  release_ms_le16  (compressor release)
-            276      threshold        (compressor)
-            277      linkgroup        (channel link/group index, 0=none)
-            278-285  name (8-byte ASCII channel label)
+            270-277  comp_shadow      (semantic unknown — reads identical
+                                       to the live compressor record but
+                                       does NOT track writes; see protocol)
+            278-279  all_pass_q_le16
+            280-281  attack_ms_le16   (compressor attack)
+            282-283  release_ms_le16  (compressor release)
+            284      threshold        (compressor)
+            285      linkgroup        (channel link/group index, 0=none)
+            286-293  name (8-byte ASCII channel label)
 
         Returns the legacy keys (``db``, ``muted``, ``delay``, ``subidx``)
-        plus the new keys (``polar``, ``eq_mode``, ``hpf``, ``lpf``,
-        ``mixer``, ``compressor``, ``linkgroup``, ``name``, ``raw``).
+        plus the new keys (``polar``, ``byte_252``, ``spk_type``, ``hpf``,
+        ``lpf``, ``mixer``, ``compressor``, ``linkgroup``, ``name``,
+        ``raw``).  ``byte_252`` is the raw value of blob[252] — semantic
+        unknown (was previously called ``eq_mode``; see protocol.py).
 
         ``hpf``/``lpf`` are sub-dicts ``{"freq", "filter", "slope"}``.
         ``compressor`` is ``{"attack_ms", "release_ms", "threshold",
@@ -615,7 +636,7 @@ class Device:
 
         polar = blob[OFF_POLAR]
         raw_delay = int.from_bytes(blob[OFF_DELAY:OFF_DELAY + 2], "little")
-        eq_mode = blob[OFF_EQ_MODE]
+        byte_252 = blob[OFF_BYTE_252]
         spk_type = blob[OFF_SPK_TYPE]
 
         hpf = {
@@ -661,7 +682,7 @@ class Device:
             "subidx": spk_type,
             # new keys
             "polar": bool(polar),
-            "eq_mode": eq_mode,
+            "byte_252": byte_252,  # semantic unknown — see protocol.OFF_BYTE_252
             "spk_type": spk_type,
             "hpf": hpf,
             "lpf": lpf,
@@ -678,12 +699,15 @@ class Device:
     def get_channel(self, channel: int) -> dict:
         """Read per-channel state from the device and return it.
 
-        Issues a ``cmd=0x77NN`` read, parses the 296-byte blob to extract
-        volume, mute, delay, and the DSP channel-type (subidx).  Updates
-        the in-memory cache (including the actual subidx so subsequent
-        :meth:`set_channel` writes preserve the firmware's type assignment)
-        and returns a dict with keys: ``db`` (float), ``muted`` (bool),
-        ``delay`` (int), ``subidx`` (int).
+        Issues a ``cmd=0x77NN`` read, parses the 296-byte blob into the
+        full channel-state dict (see :meth:`parse_channel_state_blob` for
+        the field list), and seeds the in-memory cache with the subset
+        :meth:`set_channel` needs to round-trip writes correctly.
+
+        Returns the full parsed dict on success — keys include ``db``,
+        ``muted``, ``delay``, ``subidx``, ``polar``, ``byte_252``,
+        ``spk_type``, ``hpf``, ``lpf``, ``mixer``, ``compressor``,
+        ``linkgroup``, ``name``, and ``raw`` (the original bytes).
 
         If the blob cannot be parsed (blob too short, or en_bit/vol out of
         range), returns the cached defaults and logs a warning.
@@ -721,15 +745,19 @@ class Device:
         value: int,
         sub_index: int,
     ) -> None:
-        """Write a single channel parameter.
+        """Low-level channel-write escape hatch (cmd=0x1F00..0x1F07).
 
         Payload layout observed in windows-04c-stream-nostream-stream:
             01 00 | value_le_u32 | 00 | sub_index
 
-        Sub-index → parameter mapping (incomplete — needs live validation):
-            0x1f02/0x03, 0x1f03/0x07, 0x1f04/0x08, 0x1f05/0x09,
-            0x1f06/0x0f, 0x1f07/0x12. Likely one sub-index per parameter
-            type (volume/mute/delay/phase/hpf/lpf/band1/band2/...).
+        ``sub_index`` is the **speaker-role / channel-type byte** stored
+        at blob[253] (see :data:`protocol.CHANNEL_SUBIDX` and
+        :data:`protocol.SPK_TYPE_NAMES`) — not a parameter selector as
+        early reverse-engineering had hypothesized.  Prefer the typed
+        wrappers (:meth:`set_channel`, :meth:`set_eq_band`,
+        :meth:`set_crossover`) for normal use; this method exists only
+        for replaying captured frames or probing unknown speaker-role
+        values.
         """
         if not 0 <= channel <= 7:
             raise ValueError(f"channel must be in 0..7, got {channel}")
@@ -802,10 +830,13 @@ class Device:
         .. code-block:: text
 
             [0] mute      0=muted, 1=audible (en_bit, INVERTED from leon)
-            [1] polar     0=normal, 1=phase-inverted (180°)  ← was always 0
+            [1] polar     0=normal, 1=phase-inverted (180°)
             [2..3] gain_le16  raw = (dB×10)+600
             [4..5] delay_le16 samples
-            [6] eq_mode   reserved/0 in our writes today
+            [6] byte_6    semantic unknown — stored at blob[252] but does
+                          NOT bypass EQ (was hypothesized to be `eq_mode`,
+                          disproved live; see protocol.OFF_BYTE_252).
+                          We always write 0 here.
             [7] subidx    DSP channel-type / speaker-role
 
         Args:
@@ -1173,9 +1204,13 @@ class Device:
     #   b4= 26 → BW₃≈129 Hz (Q≈7.8) ;  b4= 52 → BW₃≈223 Hz (Q≈4.5, default)
     #   b4=104 → BW₃≈410 Hz (Q≈2.5) ;  b4=208 → BW₃≈873 Hz (Q≈1.2)
     # All peak gains land within ±0.1 dB of the requested value.
-    EQ_BAND_COUNT = EQ_BAND_COUNT
-    EQ_Q_BW_CONSTANT = EQ_Q_BW_CONSTANT
-    EQ_DEFAULT_FREQS_HZ = EQ_DEFAULT_FREQS_HZ
+    # Re-export the protocol constants on the class surface so callers
+    # can write `Device.EQ_BAND_COUNT` without importing protocol.
+    # Local aliases avoid the self-assignment warning some linters emit
+    # when class-body names shadow module-level imports of the same name.
+    EQ_BAND_COUNT = int(EQ_BAND_COUNT)
+    EQ_Q_BW_CONSTANT = float(EQ_Q_BW_CONSTANT)
+    EQ_DEFAULT_FREQS_HZ = tuple(EQ_DEFAULT_FREQS_HZ)
 
     @staticmethod
     def q_to_bandwidth_byte(q: float) -> int:
@@ -1248,14 +1283,74 @@ class Device:
                 raise ValueError(
                     f"bandwidth_byte must be 1..255, got {bandwidth_byte}")
             b4 = bandwidth_byte
-        raw = max(0, min(1200,
-                         round(gain_db * 10 + CHANNEL_VOL_OFFSET)))
+        raw = max(EQ_GAIN_RAW_MIN, min(EQ_GAIN_RAW_MAX,
+                                       round(gain_db * 10 + CHANNEL_VOL_OFFSET)))
         payload = bytes([
             freq_hz & 0xFF, (freq_hz >> 8) & 0xFF,
             raw & 0xFF, (raw >> 8) & 0xFF,
             b4, 0, 0, 0,
         ])
         cmd = CMD_WRITE_EQ_BAND_BASE + (band << 8) + channel
+        self.write_raw(cmd=cmd, data=payload, category=CAT_PARAM)
+
+    # ── per-channel compressor ─────────────────────────────────────────
+    def set_compressor(
+        self,
+        channel: int,
+        attack_ms: int,
+        release_ms: int,
+        threshold: int,
+        *,
+        all_pass_q: int = 420,
+        enable: bool = True,
+    ) -> None:
+        """Write per-channel compressor parameters (cmd=0x2300+ch).
+
+        Wire encoding decoded from
+        ``captures/windows-04b-volumes-mute-presets.pcapng`` and verified
+        live 2026-04-19: the 8-byte payload lands at blob[278..285] (NOT
+        270..277 as one earlier note suggested — those bytes are a
+        read-only shadow that ignores writes).  All four distinctive
+        values (attack/release/threshold/all_pass_q) round-trip exactly
+        through ``read_channel_state()`` after this write.
+
+        ⚠ **Compressor *behavior* still unverified.** The wire format is
+        confirmed but we have NOT yet driven the loopback rig hard
+        enough to fit an attack/release/threshold curve on a real audio
+        signal — so the *units* of ``threshold`` (claimed dB-scaled) and
+        the meaning of byte[7] ``enable`` are still inferred, not
+        measured.  Use with caution until the compressor probe lands.
+
+        Args:
+            channel:     0..7 (output index).
+            attack_ms:   compressor attack time in ms (u16; firmware default 56).
+            release_ms:  release time in ms (u16; firmware default 500).
+            threshold:   level above which compression engages (u8; units
+                         not yet calibrated).
+            all_pass_q:  internal all-pass-filter Q used for sidechain
+                         shaping (u16; firmware default 420). Leave
+                         unchanged unless you know what you're doing.
+            enable:      payload byte[7]: True=on, False=bypass (guess
+                         from a single capture; behavior not verified).
+        """
+        if not 0 <= channel <= 7:
+            raise ValueError(f"channel must be in 0..7, got {channel}")
+        if not 0 <= attack_ms <= 0xFFFF:
+            raise ValueError(f"attack_ms must fit u16, got {attack_ms}")
+        if not 0 <= release_ms <= 0xFFFF:
+            raise ValueError(f"release_ms must fit u16, got {release_ms}")
+        if not 0 <= threshold <= 0xFF:
+            raise ValueError(f"threshold must fit u8, got {threshold}")
+        if not 0 <= all_pass_q <= 0xFFFF:
+            raise ValueError(f"all_pass_q must fit u16, got {all_pass_q}")
+        payload = bytes([
+            all_pass_q & 0xFF, (all_pass_q >> 8) & 0xFF,
+            attack_ms & 0xFF, (attack_ms >> 8) & 0xFF,
+            release_ms & 0xFF, (release_ms >> 8) & 0xFF,
+            threshold & 0xFF,
+            1 if enable else 0,
+        ])
+        cmd = CMD_WRITE_COMPRESSOR_BASE + channel
         self.write_raw(cmd=cmd, data=payload, category=CAT_PARAM)
 
     # ── one-shot snapshot ──────────────────────────────────────────────

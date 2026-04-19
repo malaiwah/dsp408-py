@@ -18,7 +18,9 @@ Measurement chain:
 This script does two things:
   1.  b4 sweep (Q calibration): hold band5 at fc=1000 Hz / +12 dB; vary b4
       across {8, 16, 26, 52, 78, 104, 156, 208}; measure each peak's
-      -3 dB bandwidth and check the Q × b4 ≈ 260 law from the discrete-tone run.
+      -3 dB bandwidth and check the Q × b4 ≈ 256 law (= 2⁸ fixed-point
+      reciprocal — initial sparse measurements suggested ≈260 but the
+      pink-noise sweep narrowed it to 256).
   2.  Multiband sanity: enable bands 2/5/8 simultaneously (250 / 1000 / 4000 Hz)
       at +6 dB each, b4=52, and confirm we see three distinct peaks.
 
@@ -202,5 +204,5 @@ with Device.open(path=info["path"]) as dsp:
         dsp.set_channel(ch, db=0.0, muted=False)
 
 print("\n=== Summary ===")
-print("If b4 · Q ≈ 260 holds across the whole sweep, the firmware encodes Q via")
-print("a 1/x bandwidth byte (so the GUI's Q slider is roughly 260/b4).")
+print("Final fit: b4 · Q ≈ 256 (= 2⁸) across b4∈[39..156] — the firmware")
+print("encodes Q as a 1/x bandwidth byte (so the GUI's Q slider is 256/b4).")

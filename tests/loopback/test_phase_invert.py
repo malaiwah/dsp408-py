@@ -80,7 +80,8 @@ def write_basic_record_with_polar(dsp: Device, channel: int,
         en_bit, pol_bit,
         raw_vol & 0xFF, (raw_vol >> 8) & 0xFF,
         delay_samples & 0xFF, (delay_samples >> 8) & 0xFF,
-        0,                        # eq_mode (untested for now, leave 0)
+        0,                        # byte[6] — semantic unknown (was hypothesized
+                                  # to be eq_mode; live probe disproved it).
         si & 0xFF,
     ])
     cmd = CMD_WRITE_CHANNEL_BASE + channel  # 0x1f00..0x1f07

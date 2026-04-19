@@ -26,9 +26,16 @@ bridge-level LWT adds a second availability entry (pl_avail/pl_not_avail)
 so that if the bridge process dies *every* device (not just the first)
 flips to unavailable in HA immediately.
 
-Most per-channel audio controls (gain / mute / phase / delay / EQ) are
-not exposed yet because the 0x77NN layout is not decoded. Once the
-layout is known, add them to `DeviceWorker.build_discovery_payload()`.
+Per-channel controls exposed today:
+  * volume (-60..0 dB), mute, phase invert (polar), delay (samples)
+  * 4×8 routing-matrix cells (both ON/OFF switch + 0..255 numeric level)
+  * Full per-channel state document at ``ch{n}_state/state`` (one JSON
+    sensor per output exposing crossover / mixer / compressor / link
+    group / channel name) — refreshed both at startup and on each poll.
+EQ-band, crossover, and compressor *write* APIs are present in
+:mod:`dsp408.device` but not yet wired to MQTT discovery (the entity
+count would explode); the typed Device methods are reachable from HA
+via the ``raw/write`` cmd topic if needed.
 
 Requires `paho-mqtt` (install with `uv sync --extra mqtt`).
 """
@@ -770,13 +777,25 @@ class DeviceWorker:
         self.publish("status_byte/state", status_byte, retain=True)
         self.publish("state_0x13/state", state13, retain=False)
         self.publish("global_06/state", g06, retain=False)
-        # Master is the only sliders that has a reliable readback. Per-
-        # channel volume + mute and routing reads return EQ-table data,
-        # so for those we publish what we last set (cached) — the user's
-        # HA-side actions go through us, so the cache stays consistent.
+        # Master is the only slider that comes back via a dedicated read
+        # cmd; per-channel state lives in the 296-byte 0x77NN blob and
+        # gets re-read + re-published below so the ch{n}_state JSON
+        # sensors stay live (not snapshot-only).
         self.publish("master_volume/state", f"{master_db:g}", retain=True)
         self.publish("master_mute/state",
                      "ON" if master_muted else "OFF", retain=True)
+
+        # Refresh the per-channel state JSON on every poll. We swallow
+        # per-channel exceptions so a transient HID hiccup on one
+        # channel doesn't kill the whole poll cycle.
+        for n in range(1, 9):
+            try:
+                state = dev.get_channel(n - 1)
+            except Exception as e:
+                log.debug("%s: ch%d poll-refresh failed: %s",
+                          self.slug, n, e)
+                continue
+            self._publish_channel_state(n, state)
 
     def _publish_channel_state(self, n: int, state: dict) -> None:
         """Publish the per-channel JSON state document.
@@ -814,7 +833,14 @@ class DeviceWorker:
         delay_samples = int(state.get("delay", 0))
         doc = {
             "polar": bool(state.get("polar", False)),
-            "eq_mode": int(state.get("eq_mode", 0)),
+            # Raw value of blob[252].  Semantic unknown — leon called this
+            # "eq_mode" but the live probe disproved that interpretation
+            # (writes round-trip but do NOT bypass EQ).  Exposed under
+            # `byte_252` so HA users don't wire automations on a misleading
+            # name.  The legacy `eq_mode` key is kept as an alias for one
+            # release to avoid breaking existing dashboards.
+            "byte_252": int(state.get("byte_252", state.get("eq_mode", 0))),
+            "eq_mode": int(state.get("byte_252", state.get("eq_mode", 0))),  # DEPRECATED
             "spk_type": _spk_name(int(state.get("spk_type", 0))),
             "spk_type_raw": int(state.get("spk_type", 0)),
             "name": state.get("name", ""),
