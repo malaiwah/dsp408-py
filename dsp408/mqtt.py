@@ -256,6 +256,78 @@ class DeviceWorker:
                 "stat_t": self.t("global_06/state"),
                 "ent_cat": "diagnostic",
             },
+            # Master volume slider (-60..+6 dB, 1 dB step)
+            "master_volume": {
+                "p": "number",
+                "name": "Master volume",
+                "uniq_id": f"dsp408_{self.slug}_master_volume",
+                "stat_t": self.t("master_volume/state"),
+                "cmd_t": self.t("master_volume/set"),
+                "min": -60,
+                "max": 6,
+                "step": 1,
+                "unit_of_meas": "dB",
+                "icon": "mdi:volume-high",
+                "mode": "slider",
+            },
+            # Master mute switch
+            "master_mute": {
+                "p": "switch",
+                "name": "Master mute",
+                "uniq_id": f"dsp408_{self.slug}_master_mute",
+                "stat_t": self.t("master_mute/state"),
+                "cmd_t": self.t("master_mute/set"),
+                "pl_on": "ON",
+                "pl_off": "OFF",
+                "icon": "mdi:volume-off",
+            },
+            # Per-channel volume + mute (8 each)
+            **{
+                f"ch{n}_volume": {
+                    "p": "number",
+                    "name": f"Channel {n} volume",
+                    "uniq_id": f"dsp408_{self.slug}_ch{n}_volume",
+                    "stat_t": self.t(f"ch{n}_volume/state"),
+                    "cmd_t": self.t(f"ch{n}_volume/set"),
+                    "min": -60,
+                    "max": 0,
+                    "step": 0.5,
+                    "unit_of_meas": "dB",
+                    "icon": "mdi:tune-vertical-variant",
+                    "mode": "slider",
+                }
+                for n in range(1, 9)
+            },
+            **{
+                f"ch{n}_mute": {
+                    "p": "switch",
+                    "name": f"Channel {n} mute",
+                    "uniq_id": f"dsp408_{self.slug}_ch{n}_mute",
+                    "stat_t": self.t(f"ch{n}_mute/state"),
+                    "cmd_t": self.t(f"ch{n}_mute/set"),
+                    "pl_on": "ON",
+                    "pl_off": "OFF",
+                    "icon": "mdi:volume-mute",
+                }
+                for n in range(1, 9)
+            },
+            # Per-output input-routing switches: 8 outs × 4 ins = 32 switches.
+            # `out{N}_in{M}` toggles whether IN<M> feeds Out<N>.
+            **{
+                f"out{n}_in{m}": {
+                    "p": "switch",
+                    "name": f"Out {n} ← In {m}",
+                    "uniq_id": f"dsp408_{self.slug}_out{n}_in{m}",
+                    "stat_t": self.t(f"route/out{n}_in{m}/state"),
+                    "cmd_t": self.t(f"route/out{n}_in{m}/set"),
+                    "pl_on": "ON",
+                    "pl_off": "OFF",
+                    "icon": "mdi:call-merge",
+                    "ent_cat": "config",
+                }
+                for n in range(1, 9)
+                for m in range(1, 5)
+            },
         }
         return {
             "dev": dev,
@@ -311,11 +383,29 @@ class DeviceWorker:
     # ── inbound command dispatch ────────────────────────────────────
     def subscribe_commands(self) -> list[str]:
         """Return the list of topics this worker wants to subscribe to."""
-        return [
+        topics = [
             self.t("preset/set"),
             self.t("raw/read"),
             self.t("raw/write"),
+            self.t("master_volume/set"),
+            self.t("master_mute/set"),
         ]
+        for n in range(1, 9):
+            topics.append(self.t(f"ch{n}_volume/set"))
+            topics.append(self.t(f"ch{n}_mute/set"))
+        for n in range(1, 9):
+            for m in range(1, 5):
+                topics.append(self.t(f"route/out{n}_in{m}/set"))
+        return topics
+
+    # In-memory routing matrix mirror (since no working device readback).
+    # Initialised from defaults; updated whenever we publish-write a route.
+    def _routing_state_init(self) -> None:
+        if not hasattr(self, "_routing_mirror"):
+            # 8 outputs × 4 inputs of bool. We don't know the device's
+            # actual boot state, so default everything OFF; the user (or
+            # a previous retained MQTT state) will populate.
+            self._routing_mirror = [[False] * 4 for _ in range(8)]
 
     def handle_command(self, topic: str, payload_bytes: bytes) -> None:
         """Dispatch an inbound MQTT command to the Device."""
@@ -335,12 +425,72 @@ class DeviceWorker:
             elif topic == self.t("raw/write"):
                 self._handle_raw(text, reply_suffix="raw/write/ack",
                                  is_write=True)
+            elif topic == self.t("master_volume/set"):
+                self._handle_master_volume(text)
+            elif topic == self.t("master_mute/set"):
+                self._handle_master_mute(text)
+            elif topic.startswith(self.t("ch")) and topic.endswith("_volume/set"):
+                self._handle_ch_volume(topic, text)
+            elif topic.startswith(self.t("ch")) and topic.endswith("_mute/set"):
+                self._handle_ch_mute(topic, text)
+            elif topic.startswith(self.t("route/")) and topic.endswith("/set"):
+                self._handle_route(topic, text)
             else:
                 log.warning("unhandled topic %s", topic)
-        except (DeviceNotFound, ProtocolError, OSError) as e:
+        except (DeviceNotFound, ProtocolError, OSError, ValueError) as e:
             log.error("command %s failed: %s", topic, e)
             self._close_device()
             self.publish("error/last", f"{topic}: {e}", retain=False)
+
+    # ── per-control handlers ─────────────────────────────────────────
+    def _handle_master_volume(self, text: str) -> None:
+        db = float(text.strip())
+        dev = self._ensure_device()
+        dev.set_master_volume(db)
+        self.publish("master_volume/state", f"{db:g}", retain=True, qos=1)
+
+    def _handle_master_mute(self, text: str) -> None:
+        muted = text.strip().upper() in ("ON", "TRUE", "1", "YES")
+        dev = self._ensure_device()
+        dev.set_master_mute(muted)
+        self.publish("master_mute/state", "ON" if muted else "OFF",
+                     retain=True, qos=1)
+
+    def _handle_ch_volume(self, topic: str, text: str) -> None:
+        # topic = "<base>/ch<N>_volume/set"; extract N
+        n = int(topic.rsplit("/ch", 1)[1].split("_")[0])
+        if not 1 <= n <= 8:
+            raise ValueError(f"channel {n} out of range")
+        db = float(text.strip())
+        dev = self._ensure_device()
+        dev.set_channel_volume(n - 1, db)
+        self.publish(f"ch{n}_volume/state", f"{db:g}", retain=True, qos=1)
+
+    def _handle_ch_mute(self, topic: str, text: str) -> None:
+        n = int(topic.rsplit("/ch", 1)[1].split("_")[0])
+        if not 1 <= n <= 8:
+            raise ValueError(f"channel {n} out of range")
+        muted = text.strip().upper() in ("ON", "TRUE", "1", "YES")
+        dev = self._ensure_device()
+        dev.set_channel_mute(n - 1, muted)
+        self.publish(f"ch{n}_mute/state", "ON" if muted else "OFF",
+                     retain=True, qos=1)
+
+    def _handle_route(self, topic: str, text: str) -> None:
+        # topic = "<base>/route/out<N>_in<M>/set"
+        tail = topic.split("/route/", 1)[1]  # e.g. "out3_in2/set"
+        cell = tail.split("/", 1)[0]          # "out3_in2"
+        out_n = int(cell.split("_")[0][3:])   # "out3" → 3
+        in_m = int(cell.split("_")[1][2:])    # "in2"  → 2
+        on = text.strip().upper() in ("ON", "TRUE", "1", "YES")
+        self._routing_state_init()
+        self._routing_mirror[out_n - 1][in_m - 1] = on
+        row = self._routing_mirror[out_n - 1]
+        dev = self._ensure_device()
+        dev.set_routing(out_n - 1,
+                        in1=row[0], in2=row[1], in3=row[2], in4=row[3])
+        self.publish(f"route/out{out_n}_in{in_m}/state",
+                     "ON" if on else "OFF", retain=True, qos=1)
 
     def _handle_raw(self, text: str, reply_suffix: str, is_write: bool) -> None:
         try:
@@ -391,12 +541,56 @@ class DeviceWorker:
         status_byte = dev.read_status()
         state13 = dev.read_state_0x13()
         _, _, g06 = dev.read_globals()
+        master_db, master_muted = dev.get_master()
 
         self.publish("identity/state", identity, retain=True)
         self.publish("preset/state", preset, retain=True)
         self.publish("status_byte/state", status_byte, retain=True)
         self.publish("state_0x13/state", state13, retain=False)
         self.publish("global_06/state", g06, retain=False)
+        # Master is the only sliders that has a reliable readback. Per-
+        # channel volume + mute and routing reads return EQ-table data,
+        # so for those we publish what we last set (cached) — the user's
+        # HA-side actions go through us, so the cache stays consistent.
+        self.publish("master_volume/state", f"{master_db:g}", retain=True)
+        self.publish("master_mute/state",
+                     "ON" if master_muted else "OFF", retain=True)
+
+    def publish_initial_cached_state(self) -> None:
+        """Publish per-channel + routing initial state on startup.
+
+        These entities don't have a working device readback (the device
+        returns the EQ filter table for those addresses). So we publish
+        what we (or a previous bridge run via MQTT retained messages)
+        last knew. Defaults: per-channel 0 dB unmuted, routing all OFF.
+
+        Without this, the HA UI sliders/switches stay blank until the
+        user touches them — confusing if you just opened HA and want to
+        see "where is everything set right now."
+        """
+        self._routing_state_init()
+        # Per-channel
+        try:
+            dev = self._ensure_device()
+            dev._channel_cache_init()
+        except Exception as e:
+            log.warning("%s: initial channel publish skipped: %s",
+                        self.slug, e)
+            return
+        for n in range(1, 9):
+            cached = dev.get_channel_cached(n - 1)
+            self.publish(f"ch{n}_volume/state",
+                         f"{cached['db']:g}", retain=True, qos=1)
+            self.publish(f"ch{n}_mute/state",
+                         "ON" if cached["muted"] else "OFF",
+                         retain=True, qos=1)
+        # Routing matrix
+        for n in range(1, 9):
+            for m in range(1, 5):
+                on = self._routing_mirror[n - 1][m - 1]
+                self.publish(f"route/out{n}_in{m}/state",
+                             "ON" if on else "OFF",
+                             retain=True, qos=1)
 
     def run(self) -> None:
         """Thread entry point. Polls the device until stopped.
@@ -415,6 +609,10 @@ class DeviceWorker:
         except Exception as e:
             log.warning("%s: initial get_info failed: %s", self.slug, e)
         self.publish_discovery()
+        # HA needs initial values for sliders/switches to render properly,
+        # so publish per-channel + routing defaults from cache. Master is
+        # populated by the regular poll loop.
+        self.publish_initial_cached_state()
 
         backoff = 1.0
         while not self._stop.is_set():

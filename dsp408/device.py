@@ -47,23 +47,34 @@ from .config import friendly_name_for, load_aliases
 from .protocol import (
     CAT_PARAM,
     CAT_STATE,
+    CHANNEL_SUBIDX,
+    CHANNEL_VOL_MAX,
+    CHANNEL_VOL_MIN,
+    CHANNEL_VOL_OFFSET,
     CMD_CONNECT,
     CMD_GET_INFO,
+    CMD_GLOBAL_0x02,
+    CMD_GLOBAL_0x05,
+    CMD_GLOBAL_0x06,
     CMD_IDLE_POLL,
+    CMD_MASTER,
     CMD_PRESET_NAME,
     CMD_READ_CHANNEL_BASE,
+    CMD_ROUTING_BASE,
+    CMD_STATE_0x13,
     CMD_STATUS,
     CMD_WRITE_CHANNEL_BASE,
     DIR_CMD,
     DIR_RESP,
     DIR_WRITE,
     DIR_WRITE_ACK,
+    MASTER_LEVEL_MAX,
+    MASTER_LEVEL_MIN,
+    MASTER_LEVEL_OFFSET,
     PID,
+    ROUTING_OFF,
+    ROUTING_ON,
     VID,
-    CMD_GLOBAL_0x02,
-    CMD_GLOBAL_0x05,
-    CMD_GLOBAL_0x06,
-    CMD_STATE_0x13,
     Frame,
     build_frame,
 )
@@ -354,7 +365,13 @@ class Device:
         if self._t is None:
             raise ProtocolError("device is closed")
         with self._lock:
-            seq = self._next_seq()
+            # WRITES (dir=a1) MUST use seq=0 — the device silently drops
+            # writes with non-zero seq on cat=0x04 cmds (per-channel volume,
+            # routing matrix, EQ). The Windows GUI uses seq=0 for every
+            # write and only increments seq for READ requests. Reads keep
+            # the auto-increment so we can still match late replies to the
+            # correct in-flight request.
+            seq = 0 if direction == DIR_WRITE else self._next_seq()
             frame = build_frame(
                 direction=direction,
                 seq=seq,
@@ -496,7 +513,11 @@ class Device:
         """
         if not 0 <= channel <= 7:
             raise ValueError(f"channel must be in 0..7, got {channel}")
-        cmd = CMD_READ_CHANNEL_BASE | (channel << 8)   # 0x7700, 0x7701, …
+        # CMD_READ_CHANNEL_BASE is 0x0077; reads in capture are 0x7700..0x7707.
+        # Channel index goes in the high byte: 0x77NN → ((0x77 << 8) | NN).
+        # (Historically this method built `0x77 | (NN<<8)` which silently
+        # produced wrong cmds for channel > 0 — fixed below.)
+        cmd = (CMD_READ_CHANNEL_BASE << 8) | channel    # 0x7700, 0x7701, …
         reply = self.read_raw(cmd=cmd, category=CAT_PARAM, timeout_ms=3000)
         return reply.payload
 
@@ -520,13 +541,146 @@ class Device:
             raise ValueError(f"channel must be in 0..7, got {channel}")
         if not 0 <= value <= 0xFFFFFFFF:
             raise ValueError("value must fit in u32")
-        cmd = CMD_WRITE_CHANNEL_BASE | (channel << 8)  # 0x1f00..0x1f07
+        # 0x1f00..0x1f07 — channel index in the LOW byte. (Historically
+        # `CMD_WRITE_CHANNEL_BASE | (channel << 8)` was used; that's a
+        # bit-collision and gave 0x1f00 for every channel — fixed.)
+        cmd = CMD_WRITE_CHANNEL_BASE + channel
         payload = (
             b"\x01\x00"
             + value.to_bytes(4, "little")
             + b"\x00"
             + bytes([sub_index & 0xFF])
         )
+        self.write_raw(cmd=cmd, data=payload, category=CAT_PARAM)
+
+    # ── master volume + mute ───────────────────────────────────────────
+    def get_master(self) -> tuple[float, bool]:
+        """Read master volume + mute state.
+
+        Returns:
+            (db, muted) where db is in -60..+6 (1 dB resolution) and
+            muted is True when the master mute bit is set.
+
+        Decode of the 8-byte payload `[lvl, 00, 00, 32, 00, 32, mute, 00]`:
+          dB = lvl - 60   (raw 60 = 0 dB, raw 0 = -60 dB, raw 66 = +6 dB)
+          mute_bit byte[6]: 1 = unmuted/audible, 0 = muted
+        """
+        reply = self.read_raw(cmd=CMD_MASTER, category=CAT_STATE)
+        p = bytes(reply.payload)
+        if len(p) < 8:
+            raise ProtocolError(f"master read returned {len(p)} bytes, want 8")
+        lvl = p[0]
+        muted = p[6] == 0
+        return float(lvl - MASTER_LEVEL_OFFSET), muted
+
+    def set_master(self, db: float, muted: bool) -> None:
+        """Write both master level + mute in one frame.
+
+        `db` is clamped to [-60, +6]. `muted` True flips the audible
+        bit off (byte[6] = 0).
+        """
+        lvl = max(MASTER_LEVEL_MIN, min(MASTER_LEVEL_MAX,
+                                        round(db + MASTER_LEVEL_OFFSET)))
+        mute_bit = 0 if muted else 1
+        payload = bytes([lvl, 0, 0, 0x32, 0, 0x32, mute_bit, 0])
+        self.write_raw(cmd=CMD_MASTER, data=payload, category=CAT_STATE)
+
+    def set_master_volume(self, db: float) -> None:
+        """Set master volume in dB (-60..+6), preserving mute state."""
+        _, muted = self.get_master()
+        self.set_master(db, muted)
+
+    def set_master_mute(self, muted: bool) -> None:
+        """Set master mute on/off, preserving volume level."""
+        db, _ = self.get_master()
+        self.set_master(db, muted)
+
+    # ── per-channel volume + mute ──────────────────────────────────────
+    @staticmethod
+    def _channel_payload(channel: int, db: float, muted: bool,
+                         delay_samples: int = 0) -> bytes:
+        """Build the 8-byte per-channel volume/mute write payload."""
+        if not 0 <= channel <= 7:
+            raise ValueError(f"channel must be in 0..7, got {channel}")
+        if not 0 <= delay_samples <= 0xFFFF:
+            raise ValueError(f"delay_samples must fit in u16, got {delay_samples}")
+        vol = max(CHANNEL_VOL_MIN, min(CHANNEL_VOL_MAX,
+                                       round(db * 10 + CHANNEL_VOL_OFFSET)))
+        en_bit = 0 if muted else 1
+        si = CHANNEL_SUBIDX[channel]
+        return bytes([
+            en_bit, 0,
+            vol & 0xFF, (vol >> 8) & 0xFF,
+            delay_samples & 0xFF, (delay_samples >> 8) & 0xFF,
+            0, si,
+        ])
+
+    # In-memory cache of per-channel state we've written. Channel reads
+    # via cmd=0x1f0X cat=0x04 return the EQ filter table (296 bytes), not
+    # the volume header — so to support "set just the mute" or "set just
+    # the volume" without losing the other field, we track what we set.
+    # Defaults (db=0, muted=False, delay=0) match the device's power-up
+    # state when audio_revive2-style routing+master writes are applied.
+    def _channel_cache_init(self) -> None:
+        if not hasattr(self, "_channel_cache"):
+            self._channel_cache: list[dict] = [
+                {"db": 0.0, "muted": False, "delay": 0} for _ in range(8)
+            ]
+
+    def set_channel(self, channel: int, db: float, muted: bool,
+                    delay_samples: int = 0) -> None:
+        """Write per-channel volume + mute + delay in one frame."""
+        self._channel_cache_init()
+        payload = self._channel_payload(channel, db, muted, delay_samples)
+        cmd = CMD_WRITE_CHANNEL_BASE + channel  # 0x1f00..0x1f07
+        self.write_raw(cmd=cmd, data=payload, category=CAT_PARAM)
+        # cache db/mute/delay so subsequent set_channel_volume/mute can
+        # preserve the other fields without a (broken) readback.
+        self._channel_cache[channel] = {
+            "db": float(db), "muted": bool(muted), "delay": int(delay_samples),
+        }
+
+    def set_channel_volume(self, channel: int, db: float) -> None:
+        """Set per-channel volume in dB (-60..0), preserving mute + delay."""
+        self._channel_cache_init()
+        c = self._channel_cache[channel]
+        self.set_channel(channel, db, c["muted"], c["delay"])
+
+    def set_channel_mute(self, channel: int, muted: bool) -> None:
+        """Set per-channel mute on/off, preserving volume + delay."""
+        self._channel_cache_init()
+        c = self._channel_cache[channel]
+        self.set_channel(channel, c["db"], muted, c["delay"])
+
+    def get_channel_cached(self, channel: int) -> dict:
+        """Return last-written (db, muted, delay) for a channel.
+
+        The device doesn't expose a clean per-channel volume read (the
+        cmd=0x1f0X cat=0x04 read returns the channel's EQ filter table
+        instead of the volume header). So we mirror what we wrote.
+        """
+        self._channel_cache_init()
+        if not 0 <= channel <= 7:
+            raise ValueError(f"channel must be in 0..7, got {channel}")
+        return dict(self._channel_cache[channel])
+
+    # ── routing matrix ─────────────────────────────────────────────────
+    def set_routing(self, output_idx: int,
+                    in1: bool, in2: bool, in3: bool, in4: bool) -> None:
+        """Set which inputs feed a given output.
+
+        `output_idx` is 0..7 (Out1..Out8). Each bool flips one input on
+        (0x64) or off (0x00).
+        """
+        if not 0 <= output_idx <= 7:
+            raise ValueError(f"output_idx must be in 0..7, got {output_idx}")
+        cmd = CMD_ROUTING_BASE + output_idx  # 0x2100..0x2107
+        b = ROUTING_ON
+        o = ROUTING_OFF
+        payload = bytes([
+            b if in1 else o, b if in2 else o, b if in3 else o, b if in4 else o,
+            0, 0, 0, 0,
+        ])
         self.write_raw(cmd=cmd, data=payload, category=CAT_PARAM)
 
     # ── one-shot snapshot ──────────────────────────────────────────────

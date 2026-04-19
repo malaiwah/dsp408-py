@@ -222,9 +222,54 @@ CMD_FW_APPLY = 0x39             # 1 byte 0x13; applies and reboots
 # Parameter commands (byte[7] = 0x04)
 # Channel-level reads: 0x7700 + channel_index (0..7), returns 296 bytes
 CMD_READ_CHANNEL_BASE = 0x0077
-# Channel-level writes (0x1f00..0x1f07, 8 sub-indices observed per channel)
+# Channel-level writes (0x1f00..0x1f07, one cmd per output channel).
+# Payload is 8 bytes:
+#     [0]  enable    (1 = audible, 0 = muted)
+#     [1]  reserved  (always 0 in captures)
+#     [2..3]  vol_le_u16     dB = (raw - 600) / 10  (0..600 = -60..0 dB)
+#     [4..5]  delay_le_u16   samples (8 ms = 384 @ 48 kHz)
+#     [6]  reserved  (always 0)
+#     [7]  subidx    one of {0x01, 0x02, 0x03, 0x07, 0x08, 0x09, 0x0f, 0x12}
+#                    for cmd index 0..7 respectively. The device echoes the
+#                    subidx back; not currently understood as a separate
+#                    parameter selector.
+# Verified live on hardware: 0x1f00→Out1 (Left), 0x1f01→Out2 (Right),
+# 0x1f02→Out3, 0x1f03→Out4 (sequential mapping).
 CMD_WRITE_CHANNEL_BASE = 0x1F00
+
+# Output-routing matrix writes (0x2100..0x2107 = Out1..Out8).
+# Payload is 8 bytes; bytes [0..3] = IN1..IN4 routing levels
+# (0x64 = ON / +0 dB unity, 0x00 = OFF). Bytes [4..7] always 0.
+CMD_ROUTING_BASE = 0x2100
+
+# Master volume + mute. Lives on the cat=0x09 plane (CMD_GLOBAL_0x05).
+# Payload is 8 bytes:
+#     [0]  level    dB = level - 60      (0..66 = -60..+6 dB)
+#     [1..5]  constants 00 00 32 00 32   (never observed to change)
+#     [6]  mute_bit (1 = unmuted/audible, 0 = muted) — note the inverted
+#                    polarity vs per-channel byte[0]
+#     [7]  reserved (always 0)
+# Same cmd code as CMD_GLOBAL_0x05; alias for self-documenting call sites.
+CMD_MASTER = 0x0005
+
 CMD_WRITE_GLOBAL = 0x2000       # writes global params (layout TBD)
+
+# Master payload constants
+MASTER_LEVEL_MIN = 0     # raw = -60 dB
+MASTER_LEVEL_MAX = 66    # raw = +6 dB
+MASTER_LEVEL_OFFSET = 60  # raw = dB + 60
+
+# Per-channel volume constants
+CHANNEL_VOL_MIN = 0      # raw = -60 dB
+CHANNEL_VOL_MAX = 600    # raw = 0 dB (unity)
+CHANNEL_VOL_OFFSET = 600  # raw = (dB * 10) + 600
+
+# Subidx for each of the 8 channel write cmds. Order matches cmd index 0..7.
+CHANNEL_SUBIDX = (0x01, 0x02, 0x03, 0x07, 0x08, 0x09, 0x0F, 0x12)
+
+# Routing input-on / off levels
+ROUTING_ON = 0x64
+ROUTING_OFF = 0x00
 
 
 __all__ = [
@@ -263,4 +308,15 @@ __all__ = [
     "CMD_READ_CHANNEL_BASE",
     "CMD_WRITE_CHANNEL_BASE",
     "CMD_WRITE_GLOBAL",
+    "CMD_ROUTING_BASE",
+    "CMD_MASTER",
+    "MASTER_LEVEL_MIN",
+    "MASTER_LEVEL_MAX",
+    "MASTER_LEVEL_OFFSET",
+    "CHANNEL_VOL_MIN",
+    "CHANNEL_VOL_MAX",
+    "CHANNEL_VOL_OFFSET",
+    "CHANNEL_SUBIDX",
+    "ROUTING_ON",
+    "ROUTING_OFF",
 ]

@@ -22,9 +22,11 @@ Two things this stack does that the Windows app does *not*:
 | Firmware flash     | **Working** — proven on Windows, incl. recovery path |
 | Multi-device       | **Working** — select by index / serial / path       |
 | MQTT + HA discovery| **Working** — one device-based config per DSP-408    |
+| Master volume + mute | **Working** — `cmd=0x0005 cat=0x09`; -60..+6 dB    |
+| Per-channel volume + mute | **Working** — `cmd=0x1f0X cat=0x04`; -60..0 dB |
+| Mixer 4×8 routing  | **Working** — `cmd=0x21XX cat=0x04`                  |
+| EQ bands / phase / delay | Decoded in capture; high-level API not yet exposed |
 | Channel state read (`0x77NN`) | **Raw bytes only** — layout still TBD    |
-| Parameter write (`0x1fNN`) | **Framing correct** — sub-index → param mapping TBD |
-| Mixer 4×8 routing  | Not implemented                                     |
 | Gradio web UI      | Device picker + raw console + firmware flash; typed widgets are placeholders |
 
 ## Install
@@ -147,22 +149,31 @@ Each attached DSP-408 auto-registers as a separate **device** in Home
 Assistant (discovery topic `homeassistant/device/dsp408_<id>/config`,
 HA 2024.12+ device-based format).
 
-**Entities exposed today** (one of each, per DSP-408):
+**Entities exposed today** (per DSP-408):
 
-| Entity              | HA type | Direction | Notes                                      |
-|---------------------|---------|-----------|--------------------------------------------|
-| Firmware identity   | sensor  | read-only | e.g. `MYDW-AV1.06`; `diagnostic`           |
-| **Preset name**     | text    | **read/write** | rename the active preset (≤15 chars)  |
-| Status byte         | sensor  | read-only | numeric; `diagnostic`                      |
-| State 0x13          | sensor  | read-only | hex blob; `diagnostic`                     |
-| Global 0x06         | sensor  | read-only | hex blob; `diagnostic`                     |
+| Entity              | HA type    | Direction | Notes                                      |
+|---------------------|------------|-----------|--------------------------------------------|
+| Firmware identity   | sensor     | read-only | e.g. `MYDW-AV1.06`; `diagnostic`           |
+| Preset name         | text       | r/w       | rename the active preset (≤15 chars)       |
+| Status byte         | sensor     | read-only | numeric; `diagnostic`                      |
+| State 0x13          | sensor     | read-only | hex blob; `diagnostic`                     |
+| Global 0x06         | sensor     | read-only | hex blob; `diagnostic`                     |
+| **Master volume**   | number     | **r/w**   | slider, -60..+6 dB (1 dB step)             |
+| **Master mute**     | switch     | **r/w**   | ON = muted                                 |
+| **Channel N volume** (×8) | number | **write** | slider, -60..0 dB (0.5 dB step)        |
+| **Channel N mute** (×8)   | switch | **write** | ON = muted                              |
+| **Out N ← In M** routing (×32) | switch | **write** | input-routing matrix; `config` |
 
-**Preset name is the only interactive control right now.** Master
-volume, per-channel mute / phase / delay, PEQ bands, HPF/LPF
-crossovers, and the 4×8 input→output matrix will light up once the
-`0x77NN` 296-byte layout is decoded live (tracked in the top-of-README
-status table). Add them in
-`dsp408/mqtt.py::DeviceWorker.build_discovery_payload()`.
+Per-channel volume / mute and routing entities are **write-only**: the
+device's read path returns the EQ filter table at the same address, so
+the bridge mirrors what HA wrote rather than polling. Master volume +
+mute have a working readback and are polled every cycle.
+
+**Routing matrix layout:** the DSP-408 boots with all 32 routing cells
+OFF (no audio path). To get audio flowing, toggle the relevant
+`Out N ← In M` switches in HA (e.g. for stereo: Out1←In1, Out2←In2).
+The bridge persists each toggle to the device immediately and to MQTT
+retained state so it survives a restart.
 
 **Availability:** there's a per-device topic `dsp408/<id>/status` plus
 a bridge-level LWT on `dsp408/bridge/status`, combined with
