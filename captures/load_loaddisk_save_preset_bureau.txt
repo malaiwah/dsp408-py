@@ -1,0 +1,17 @@
+Capture: load_loaddisk_save_preset_bureau.pcapng
+Date: 2026-04-19
+App: DSP-408.exe V1.24
+
+Contents: session isolating preset load and save operations using the
+"Bureau" preset. Intended to differentiate the USB packets emitted by
+the three related preset operations.
+
+Session sequence (in order):
+
+1. Open DSP-408.exe — device connect + initial state read
+2. Load Preset "Bureau" (load from DSP internal memory)
+3. Load from Disk "Bureau" (load from host .dsp file, write to device)
+4. Save to DSP "Bureau" (write current state back to DSP internal memory)
+5. Close DSP-408.exe
+
+Same 80 80 80 ee protocol.
