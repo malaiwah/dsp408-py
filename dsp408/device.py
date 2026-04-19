@@ -527,7 +527,7 @@ class Device:
 
     @staticmethod
     def parse_channel_state_blob(blob: bytes, channel: int) -> dict | None:
-        """Extract volume, mute, and delay from a 296-byte channel blob.
+        """Extract volume, mute, delay, and subidx from a 296-byte channel blob.
 
         The blob returned by cmd=0x77NN (read_channel_state) is the 296-byte
         channel state struct that the firmware keeps in RAM.  The last 8
@@ -536,33 +536,39 @@ class Device:
         .. code-block:: text
 
             offset  field
-            246     en_bit    1 = audible, 0 = muted
-            247     reserved  always 0x00
-            248..249 vol_le16  raw = (dB * 10) + 600; range 0..600
+            246     en_bit      1 = audible, 0 = muted
+            247     reserved    always 0x00
+            248..249 vol_le16   raw = (dB * 10) + 600; range 0..600
             250..251 delay_le16 delay in samples
-            252     reserved  always 0x00
-            253     subidx    channel identifier: one of CHANNEL_SUBIDX
+            252     reserved    always 0x00
+            253     subidx      DSP channel-type identifier; stored by the
+                                firmware when set_channel() writes this field.
+                                Default values are listed in CHANNEL_SUBIDX,
+                                but the device can be reconfigured to use any
+                                DSP type, so the actual value may differ.
 
         These offsets were confirmed from:
           1. Live device dumps of all 8 channels (every channel has the
-             same blob[0..247], then blob[248..253] with its unique subidx).
+             same blob[0..247], then blob[248..253] with channel-specific
+             state).
           2. Firmware disassembly: the second ``CMP r3, #0x77`` handler
              (file offset 0x54b8) shows ``MOV.W sl, #0x128 = 296`` as the
              exact blob size, and the per-channel struct stride of 296 bytes.
 
-        Note on channels 6 and 7: the live device returns subidx=0x00 at
-        blob[253] for these channels (they are "uninitialized" outputs that
-        the hardware doesn't actually drive).  This method returns ``None``
-        for those — callers should fall back to cached defaults.
+        Note on blob[253]: this is the DSP channel-type stored in RAM —
+        NOT a reliable channel-number validator.  Some devices are configured
+        with non-default types (e.g. ch1 with subidx=0x12).  The value
+        returned here should be **preserved** when writing back to the device
+        so the firmware's DSP type assignment is not accidentally overwritten.
 
         Note on routing: routing state is stored elsewhere in the blob;
         the exact offset is not yet decoded.  Track routing in-memory via
         :meth:`set_routing` / ``DeviceWorker._routing_mirror``.
 
         Returns:
-            dict with keys ``db`` (float), ``muted`` (bool), and
-            ``delay`` (int samples), or None if the blob is too short or
-            the subidx at blob[253] doesn't match this channel.
+            dict with keys ``db`` (float), ``muted`` (bool),
+            ``delay`` (int samples), and ``subidx`` (int), or None if the
+            blob is too short or the en_bit/vol fields are out of range.
         """
         if not 0 <= channel <= 7:
             raise ValueError(f"channel must be in 0..7, got {channel}")
@@ -570,14 +576,10 @@ class Device:
         if len(blob) < 254:
             return None
 
-        target_subidx = CHANNEL_SUBIDX[channel]
-
         # Fixed-offset read: the write-format record is always at bytes 246..253.
-        # Channels 6 and 7 have subidx=0x00 (uninitialized) — return None so
-        # the caller falls back to cached defaults rather than returning garbage.
-        if blob[253] != target_subidx:
-            return None
-
+        # blob[253] is the DSP channel-type ("subidx") — we do NOT validate it
+        # against CHANNEL_SUBIDX because the device can be configured with any
+        # type and the actual type must be preserved on write-back.
         en_bit = blob[246]
         if en_bit not in (0, 1):
             return None  # corrupt blob
@@ -589,19 +591,21 @@ class Device:
         raw_delay = int.from_bytes(blob[250:252], "little")
         db = (raw_vol - CHANNEL_VOL_OFFSET) / 10.0
         muted = (en_bit == 0)
-        return {"db": db, "muted": muted, "delay": raw_delay}
+        subidx = blob[253]
+        return {"db": db, "muted": muted, "delay": raw_delay, "subidx": subidx}
 
     def get_channel(self, channel: int) -> dict:
         """Read per-channel state from the device and return it.
 
         Issues a ``cmd=0x77NN`` read, parses the 296-byte blob to extract
-        volume, mute, and delay, updates the in-memory cache, and returns
-        a dict with keys: ``db`` (float), ``muted`` (bool),
-        ``delay`` (int).
+        volume, mute, delay, and the DSP channel-type (subidx).  Updates
+        the in-memory cache (including the actual subidx so subsequent
+        :meth:`set_channel` writes preserve the firmware's type assignment)
+        and returns a dict with keys: ``db`` (float), ``muted`` (bool),
+        ``delay`` (int), ``subidx`` (int).
 
-        If the blob cannot be parsed (e.g. an unexpected firmware version
-        changes the layout), returns the cached defaults and logs a
-        warning so the caller can still proceed gracefully.
+        If the blob cannot be parsed (blob too short, or en_bit/vol out of
+        range), returns the cached defaults and logs a warning.
         """
         self._channel_cache_init()
         blob = self.read_channel_state(channel)
@@ -610,21 +614,21 @@ class Device:
             import logging
             logging.getLogger("dsp408.device").warning(
                 "get_channel(%d): could not parse 296-byte blob "
-                "(len=%d, blob[246:254]=%s blob[253]=0x%02x, "
-                "want subidx=0x%02x). First 16 bytes: %s",
+                "(len=%d, blob[246:254]=%s). First 16 bytes: %s",
                 channel,
                 len(blob) if blob else 0,
                 blob[246:254].hex() if len(blob) >= 254 else "(short)",
-                blob[253] if len(blob) >= 254 else 0,
-                CHANNEL_SUBIDX[channel],
                 blob[:16].hex() if blob else "(empty)",
             )
             return dict(self._channel_cache[channel])
 
+        # Store discovered subidx so set_channel() writes back the correct
+        # DSP type rather than the CHANNEL_SUBIDX table default.
         self._channel_cache[channel] = {
             "db": result["db"],
             "muted": result["muted"],
             "delay": result["delay"],
+            "subidx": result["subidx"],
         }
         return result
 
@@ -705,8 +709,16 @@ class Device:
     # ── per-channel volume + mute ──────────────────────────────────────
     @staticmethod
     def _channel_payload(channel: int, db: float, muted: bool,
-                         delay_samples: int = 0) -> bytes:
-        """Build the 8-byte per-channel volume/mute write payload."""
+                         delay_samples: int = 0,
+                         sub_index: int | None = None) -> bytes:
+        """Build the 8-byte per-channel volume/mute write payload.
+
+        Args:
+            sub_index: DSP channel-type byte (blob[253]).  Pass the value
+                previously returned by ``get_channel()["subidx"]`` to
+                preserve the firmware's type assignment.  If None, falls
+                back to ``CHANNEL_SUBIDX[channel]`` (factory defaults).
+        """
         if not 0 <= channel <= 7:
             raise ValueError(f"channel must be in 0..7, got {channel}")
         if not 0 <= delay_samples <= 0xFFFF:
@@ -714,7 +726,7 @@ class Device:
         vol = max(CHANNEL_VOL_MIN, min(CHANNEL_VOL_MAX,
                                        round(db * 10 + CHANNEL_VOL_OFFSET)))
         en_bit = 0 if muted else 1
-        si = CHANNEL_SUBIDX[channel]
+        si = sub_index if sub_index is not None else CHANNEL_SUBIDX[channel]
         return bytes([
             en_bit, 0,
             vol & 0xFF, (vol >> 8) & 0xFF,
@@ -722,29 +734,54 @@ class Device:
             0, si,
         ])
 
-    # In-memory cache of per-channel state we've written. Channel reads
-    # via cmd=0x1f0X cat=0x04 return the EQ filter table (296 bytes), not
-    # the volume header — so to support "set just the mute" or "set just
-    # the volume" without losing the other field, we track what we set.
-    # Defaults (db=0, muted=False, delay=0) match the device's power-up
-    # state when audio_revive2-style routing+master writes are applied.
+    # In-memory cache of per-channel state we've written (and read back).
+    # Channel reads via cmd=0x1f0X cat=0x04 return the EQ filter table
+    # (296 bytes), not the volume header — so to support "set just the mute"
+    # or "set just the volume" without losing the other field, we track what
+    # we set.  Defaults (db=0, muted=False, delay=0, subidx=table default)
+    # match the device's power-up state.
+    #
+    # The `subidx` field is populated by get_channel() from the live device
+    # read (blob[253]).  Using the actual discovered value rather than the
+    # CHANNEL_SUBIDX table default ensures that set_channel() preserves the
+    # firmware's DSP type assignment even when a device is configured with a
+    # non-default type (e.g. ch1 with subidx=0x12 on some devices).
     def _channel_cache_init(self) -> None:
         if not hasattr(self, "_channel_cache"):
             self._channel_cache: list[dict] = [
-                {"db": 0.0, "muted": False, "delay": 0} for _ in range(8)
+                {
+                    "db": 0.0,
+                    "muted": False,
+                    "delay": 0,
+                    "subidx": CHANNEL_SUBIDX[ch],  # updated by get_channel()
+                }
+                for ch in range(8)
             ]
 
     def set_channel(self, channel: int, db: float, muted: bool,
                     delay_samples: int = 0) -> None:
-        """Write per-channel volume + mute + delay in one frame."""
+        """Write per-channel volume + mute + delay in one frame.
+
+        Uses the subidx (DSP channel-type) from the in-memory cache.  If
+        ``get_channel()`` has been called before, the cache holds the actual
+        device type (possibly non-default); otherwise falls back to
+        ``CHANNEL_SUBIDX[channel]``.  Preserving the correct subidx prevents
+        accidentally overwriting the firmware's DSP type assignment.
+        """
         self._channel_cache_init()
-        payload = self._channel_payload(channel, db, muted, delay_samples)
+        # Use the discovered subidx (from get_channel readback), falling back
+        # to the CHANNEL_SUBIDX table default for channels not yet read.
+        si = self._channel_cache[channel].get("subidx", CHANNEL_SUBIDX[channel])
+        payload = self._channel_payload(channel, db, muted, delay_samples,
+                                        sub_index=si)
         cmd = CMD_WRITE_CHANNEL_BASE + channel  # 0x1f00..0x1f07
         self.write_raw(cmd=cmd, data=payload, category=CAT_PARAM)
-        # cache db/mute/delay so subsequent set_channel_volume/mute can
-        # preserve the other fields without a (broken) readback.
+        # Update cache (preserve subidx so the next set call also uses it).
         self._channel_cache[channel] = {
-            "db": float(db), "muted": bool(muted), "delay": int(delay_samples),
+            "db": float(db),
+            "muted": bool(muted),
+            "delay": int(delay_samples),
+            "subidx": si,
         }
 
     def set_channel_volume(self, channel: int, db: float) -> None:

@@ -333,12 +333,27 @@ def test_parse_channel_blob_vol_mute(channel, db, muted, delay) -> None:
     assert result["delay"] == delay
 
 
-def test_parse_channel_blob_returns_none_for_bad_blob() -> None:
-    """A blob with wrong subidx at offset 253 returns None."""
-    # all-zeros blob: blob[253] == 0x00, but channel 0 expects subidx=0x01
-    blob = bytes(296)
-    result = Device.parse_channel_state_blob(blob, 0)
-    assert result is None
+def test_parse_channel_blob_returns_none_for_invalid_en_bit() -> None:
+    """A blob with en_bit not in {0, 1} (e.g. 2) returns None."""
+    blob = bytearray(296)
+    blob[246] = 2   # invalid: must be 0 (muted) or 1 (audible)
+    blob[248] = 88  # raw_vol=88 is valid; the en_bit check fires first
+    blob[253] = 0x01  # default ch0 subidx
+    result = Device.parse_channel_state_blob(bytes(blob), 0)
+    assert result is None, "invalid en_bit must return None"
+
+
+def test_parse_channel_blob_returns_none_for_out_of_range_vol() -> None:
+    """A blob with raw_vol > CHANNEL_VOL_MAX (600) returns None."""
+    from dsp408.protocol import CHANNEL_VOL_MAX
+    blob = bytearray(296)
+    blob[246] = 1                    # valid en_bit
+    out_of_range = CHANNEL_VOL_MAX + 1  # 601
+    blob[248] = out_of_range & 0xFF
+    blob[249] = (out_of_range >> 8) & 0xFF
+    blob[253] = 0x01
+    result = Device.parse_channel_state_blob(bytes(blob), 0)
+    assert result is None, "raw_vol > max must return None"
 
 
 def test_parse_channel_blob_returns_none_when_too_short() -> None:
@@ -372,20 +387,84 @@ def test_parse_channel_blob_all_channels_read_from_fixed_offset() -> None:
         )
 
 
-def test_parse_channel_blob_ignores_matching_subidx_elsewhere() -> None:
-    """A subidx byte that appears at a wrong offset should NOT fool the parser.
+def test_parse_channel_blob_returns_actual_subidx() -> None:
+    """The parser returns the actual blob[253] value, not the table default.
 
-    We build a blob where blob[253] is the WRONG subidx for channel 0 (i.e.
-    0x02, which is channel 1's subidx) but inject channel 0's correct record
-    at some other offset.  The parser must return None because it only reads
-    from the fixed offset.
+    Devices can have non-default DSP types (e.g. device 1's ch1 uses
+    subidx=0x12).  The 'subidx' key in the result must reflect what the
+    firmware stored, so callers can preserve it on write-back.
     """
     blob = bytearray(296)
-    # Plant channel 0's correct record at offset 0 (NOT 246).
-    from dsp408.protocol import CHANNEL_SUBIDX
-    si0 = CHANNEL_SUBIDX[0]  # 0x01
-    blob[0:8] = bytes([1, 0, 0x58, 0x02, 0, 0, 0, si0])  # vol=600, en=1
-    # Offset 253 has some other value (not channel 0's subidx).
-    blob[253] = CHANNEL_SUBIDX[1]  # 0x02 ≠ 0x01
+    blob[246] = 1           # en_bit: audible
+    blob[248] = 0x58        # raw_vol = 0x0258 = 600 → 0 dB
+    blob[249] = 0x02
+    blob[253] = 0x12        # non-default type (e.g. device 1 ch1 on live hw)
     result = Device.parse_channel_state_blob(bytes(blob), 0)
-    assert result is None, "parser should ignore record not at offset 246"
+    assert result is not None, "valid blob must parse successfully"
+    assert result["db"] == 0.0
+    assert result["muted"] is False
+    assert result["subidx"] == 0x12, (
+        "returned subidx must match blob[253], not the CHANNEL_SUBIDX table"
+    )
+
+
+def test_parse_channel_blob_all_zeros_parses_as_muted_silent() -> None:
+    """An all-zeros 296-byte blob (uninitialized channel) parses as
+    muted=True, db=-60 dB — not as an error.  The subidx=0x00 is returned
+    as-is so the caller can decide how to handle uninitialized channels.
+    """
+    blob = bytes(296)  # all zeros: en_bit=0, raw_vol=0, subidx=0
+    result = Device.parse_channel_state_blob(blob, 0)
+    assert result is not None, "all-zeros blob should parse (en_bit=0 is valid)"
+    assert result["muted"] is True   # en_bit=0 → muted
+    assert result["db"] == -60.0     # raw_vol=0 → -60 dB
+    assert result["subidx"] == 0x00  # returns whatever is at blob[253]
+
+
+def test_get_channel_updates_cache_with_discovered_subidx() -> None:
+    """get_channel() should store the actual blob[253] subidx in the cache,
+    so subsequent set_channel() calls preserve the firmware's DSP type.
+
+    The 296-byte channel read response is multi-frame on real hardware.  We
+    bypass HID framing by injecting a pre-assembled Frame directly into the
+    FakeTransport queue (FakeTransport.read_response() returns queued Frames
+    as-is, skipping HID reassembly).
+    """
+    from dsp408.protocol import CMD_READ_CHANNEL_BASE, DIR_RESP
+
+    d, t = _make_device()
+    # Build a synthetic 296-byte blob for ch1 with non-default subidx=0x12
+    non_default_si = 0x12
+    blob = bytearray(296)
+    blob[246] = 1       # audible
+    blob[248] = 0x58    # raw_vol low byte  \ 0x0258 = 600 → 0 dB
+    blob[249] = 0x02    # raw_vol high byte /
+    blob[253] = non_default_si
+    cmd = (CMD_READ_CHANNEL_BASE << 8) | 1  # 0x7701
+
+    # Inject as a pre-assembled Frame — FakeTransport returns queued frames
+    # directly, so the 296-byte payload arrives without HID framing limits.
+    synth_frame = Frame(
+        direction=DIR_RESP,
+        seq=0,
+        category=CAT_PARAM,
+        cmd=cmd,
+        payload_len=len(blob),
+        payload=bytes(blob),
+        checksum=0,
+        checksum_ok=True,
+        raw=b"\x00" * 64,  # placeholder; Device._exchange only checks .cmd
+    )
+    t.queue_reply(synth_frame)
+
+    state = d.get_channel(1)
+    assert state["subidx"] == non_default_si, (
+        "get_channel must return the actual blob[253] as subidx"
+    )
+
+    # Now set_channel on ch1 — it should use the cached subidx=0x12, not 0x02
+    d.set_channel(1, db=0.0, muted=False)
+    payload = _last_payload(t)
+    assert payload[7] == non_default_si, (
+        f"set_channel must preserve discovered subidx=0x12, got {payload[7]:#04x}"
+    )
