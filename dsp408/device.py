@@ -1350,32 +1350,57 @@ class Device:
     ) -> None:
         """Write per-channel compressor parameters (cmd=0x2300+ch).
 
-        Wire encoding decoded from
-        ``captures/windows-04b-volumes-mute-presets.pcapng`` and verified
-        live 2026-04-19: the 8-byte payload lands at blob[278..285] (NOT
-        270..277 as one earlier note suggested — those bytes are a
-        read-only shadow that ignores writes).  All four distinctive
-        values (attack/release/threshold/all_pass_q) round-trip exactly
-        through ``read_channel_state()`` after this write.
+        ⚠ **The compressor block is INERT in firmware v1.06**
+        (``MYDW-AV1.06``, the only firmware we've seen).  The wire write
+        is accepted, the 8-byte payload lands at blob[278..285] and
+        round-trips exactly through ``read_channel_state()`` — but the
+        audio engine never acts on the values.
 
-        ⚠ **Compressor *behavior* still unverified.** The wire format is
-        confirmed but we have NOT yet driven the loopback rig hard
-        enough to fit an attack/release/threshold curve on a real audio
-        signal — so the *units* of ``threshold`` (claimed dB-scaled) and
-        the meaning of byte[7] ``enable`` are still inferred, not
-        measured.  Use with caution until the compressor probe lands.
+        Six independent theories were tested live on the loopback rig
+        (2026-04-19, ``tests/loopback/_probe_compressor.py`` and
+        ``_probe_compressor_extreme.py``):
+
+          * Full threshold sweep 0..255 with hot input (-3 dBFS), atk=1 ms,
+            rel=10 ms, enable=1 — output never moves more than ±0.05 dB.
+          * Enable byte tried as 0, 1, 2, 0x10, 0xFF — identical.
+          * Attack/release programmed across two decades (10..2000 ms) —
+            measured envelope time-constants stay at the audio system's
+            ~93 ms baseline, never tracking the programmed value.
+          * Toggling blob[252] (the formerly-named ``eq_mode`` byte) as
+            an alternate compressor enable — no effect.
+          * "Kicking" with a master-volume re-write after each
+            compressor frame, in case the audio engine needs a reload
+            trigger — no effect.
+          * Compressor on ch6 (the channel the Windows GUI toggled in
+            ``windows-04b-volumes-mute-presets.pcapng``) — wire
+            round-trips identically; ch6 isn't wired through our
+            Scarlett rig so audio not directly measurable.
+
+        Best guess: the compressor is a planned-but-not-implemented
+        feature in v1.06.  The Windows GUI exposes the toggle, but it
+        may itself be a UI placeholder — the user who took the
+        windows-04b capture exercised the button without verifying any
+        audible compression.
+
+        This method is kept because:
+          1. The wire encoding is verified — useful for future firmware
+             revisions that may activate the block.
+          2. Reads come back exactly, so it's safe to round-trip values
+             through it for state preservation.
+          3. If a future firmware update activates compression, callers
+             will already have a working API surface.
 
         Args:
             channel:     0..7 (output index).
             attack_ms:   compressor attack time in ms (u16; firmware default 56).
             release_ms:  release time in ms (u16; firmware default 500).
             threshold:   level above which compression engages (u8; units
-                         not yet calibrated).
-            all_pass_q:  internal all-pass-filter Q used for sidechain
-                         shaping (u16; firmware default 420). Leave
-                         unchanged unless you know what you're doing.
-            enable:      payload byte[7]: True=on, False=bypass (guess
-                         from a single capture; behavior not verified).
+                         not yet calibrated — and irrelevant until the
+                         block is activated in firmware).
+            all_pass_q:  internal all-pass-filter Q (u16; firmware default
+                         420). Leave unchanged.
+            enable:      payload byte[7]: True=1, False=0. Wire-verified
+                         to round-trip; audio behavior not engaged.
         """
         if not 0 <= channel <= 7:
             raise ValueError(f"channel must be in 0..7, got {channel}")
