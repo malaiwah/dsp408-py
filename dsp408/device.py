@@ -770,8 +770,10 @@ class Device:
         """
         self._channel_cache_init()
         # Use the discovered subidx (from get_channel readback), falling back
-        # to the CHANNEL_SUBIDX table default for channels not yet read.
-        si = self._channel_cache[channel].get("subidx", CHANNEL_SUBIDX[channel])
+        # to the CHANNEL_SUBIDX table default for channels not yet read or
+        # for channels whose subidx is 0x00 (uninitialized firmware struct).
+        cached_si = self._channel_cache[channel].get("subidx", 0)
+        si = cached_si if cached_si != 0 else CHANNEL_SUBIDX[channel]
         payload = self._channel_payload(channel, db, muted, delay_samples,
                                         sub_index=si)
         cmd = CMD_WRITE_CHANNEL_BASE + channel  # 0x1f00..0x1f07
