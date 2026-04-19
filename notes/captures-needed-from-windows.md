@@ -18,7 +18,46 @@ the resulting pcapng so the encoding can be decoded without having to ask
 
 ---
 
-## 1. Per-channel name / label  (high value, low effort)
+## ✅ 0. Status as of 2026-04-19 evening
+
+Major protocol expansion landed via the leon Android v1.23 source mining
+(`/tmp/dsp408-apk/jadx-leon/`) + new Windows captures + extensive live-rig
+verification. Most items below are now resolved — see commit
+`2ffa57a` on `main` of usb_dsp_mac for the full implementation.
+
+Now **fully decoded and live-verified**:
+  * Per-output channel name (DataID=36, cmd=0x2400+ch) — `set_channel_name`
+  * Filter-type byte 3 = LR alias (NOT "Defeat"); GUI's "Defeat" button is
+    cosmetic (sets type=3 + freq to extreme)
+  * INPUT processing surface (DataType=3, cat=0x03):
+    - `set_input` (DataID=9 MISC: feedback/polar/mode/mute/delay/volume)
+    - `set_input_eq_band` (DataIDs 0..14 minus 9/10/11)
+    - `set_input_noisegate` (DataID=11)
+    - `write_input_dataid10` (DataID=10, escape hatch — semantic still TBD)
+    - `read_input_state` (288-byte input blob)
+  * Mixer 8 cells per row (was 4 — bug fix)
+  * Mixer high half (cmd=0x2200+ch, IN9..IN16 — DSP-816 forward-compat)
+  * Compressor `linkgroup` byte (was misnamed `enable`; block remains
+    inert in firmware v1.06)
+  * Multi-frame WRITE transport support — wire pattern matches GUI
+    bytes verbatim from `load_loaddisk_save_preset_bureau.pcapng`
+  * `set_full_channel_state` (296-byte write) — works, with one
+    documented firmware quirk: bytes 48..49 of the input blob are
+    silently dropped (the GUI exhibits the same)
+  * `save_preset` (cmd=0x34=01 trigger + bulk writes) — completes;
+    persistence across power cycle still TBD
+  * `apply_speaker_template` (mnemonic wrapper around spk_type write)
+  * `.jssh` / `.jsah` cipher (`dsp408.jssh` module) — symmetric
+    position-XOR per leon source
+
+Remaining open questions are listed below by priority. The biggest
+unknown is now **VU meter / live audio level** (item #8) which has
+three independent lines of negative evidence (firmware disasm + live
+read static + leon source has no decoder). May be impossible.
+
+---
+
+## 1. Per-channel name / label  (high value, low effort) — ✅ RESOLVED
 
 **What we don't know:** the cmd code that writes the 8-byte ASCII channel name
 field at `blob[OFF_NAME .. OFF_NAME+8]`.  We've never seen the GUI rename a
