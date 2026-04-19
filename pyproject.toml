@@ -48,7 +48,16 @@ packages = ["dsp408"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
-extend-exclude = ["dsp-408-ui", "downloads"]
+extend-exclude = [
+    "dsp-408-ui",
+    "downloads",
+    # Loopback probes are scratch scripts that intentionally do
+    # `sys.path.insert(0, "/home/mbelleau/dsp408")` BEFORE importing
+    # audio_io (which needs that path resolved). Auto-organizing the
+    # imports moves them above the path-insert and breaks them. They
+    # run only on the rig host, never on CI.
+    "tests/loopback",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP"]
