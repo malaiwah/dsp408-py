@@ -190,7 +190,11 @@ acoustic response.
 **What we have:** 4 frames in `windows-04b-volumes-mute-presets.pcapng`
 that toggled the compressor enable bit on/off for ch6 and ch7, with
 fixed values (`Q=420, attack=56 ms, release=500 ms, threshold=0`).  That
-nailed the cmd (`0x2300 + ch`) and payload layout, but we don't know:
+nailed the cmd (`0x2300 + ch`) and 8-byte payload layout, **and the
+wire encoding has since been verified live**: writes to cmd=0x2301
+land at blob[278..285] and round-trip exactly through
+`read_channel_state()` (verified 2026-04-19, see `Device.set_compressor()`).
+What we still don't know:
 - What the `Q_le16` field actually does — it might be ratio (1:N), it
   might be the all-pass-Q the leon decompile claims, or it might be
   something else entirely.
@@ -381,24 +385,20 @@ diff against existing captures.
 
 ---
 
-## Side note: blob field offsets may have shifted between firmware versions
+## ✅ RESOLVED: blob field offsets — compressor at 278..285
 
-`notes/blob-layout-verification.md` (from an earlier verification run)
-puts the compressor record at offsets **278..285**:
+Live verification 2026-04-19 (distinctive byte injection via cmd=0x2301
+on the loopback rig) settled the disagreement: the compressor record
+lives at blob[**278..285**] (matching the originally-VERIFIED block at
+the top of `blob-layout-verification.md`), and the channel name field
+is at blob[**286..293**].  The "Updated layout" mid-document
+re-alignment in `blob-layout-verification.md` (which had moved
+compressor down to 270..277 and name to 278..285) was wrong — bytes
+270..277 are a read-only shadow that happens to mirror the same
+default values (Q=420, A=56, R=500) but ignores writes; best guess is
+a "factory default" preload used by the GUI's reset-compressor button.
 
-```
-allPassQ_le16  at 278..279  reads 420
-attackTime     at 280..281  reads 56 ms
-releaseTime    at 282..283  reads 500 ms
-threshold      at 284
-linkgroup      at 285
-```
-
-But `dsp408/protocol.py` currently has them at offsets **270..277**
-(8 bytes earlier).  The new compressor cmd we just decoded
-(`cmd=0x2300+ch`) writes the *same* values (Q=420, attack=56,
-release=500), so those values clearly *are* there — but the offsets
-should be cross-checked against a fresh `read_channel_state()` blob to
-see which file is right for current firmware.  This isn't a capture
-question per se, but it's a convenient thing to verify whenever the
-rig is hot.
+`dsp408/protocol.py` was updated to the live-verified offsets, and
+`set_compressor()` now round-trips exactly through
+`read_channel_state()`.  See `OFF_COMP_SHADOW`, `OFF_ALL_PASS_Q`,
+`OFF_NAME` in protocol.py.

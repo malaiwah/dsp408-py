@@ -98,8 +98,11 @@ This is **identical to what our `0x1FNN` write payload looks like** — confirme
 [7]     type_u8     (0=peak, 1=lowshelf, 2=highshelf, 3+=other)
 ```
 
-**Manual claims 10 bands per channel; firmware actually has 31.** Up to band 30 = `DataID=30`.
-Bands 11..30 are not exposed in any UI we've seen but are addressable.
+**Manual claims 10 bands per channel; leon's data model has 31** (`DataID` up to 30).
+But our DSP-408 firmware **only honors writes to bands 0..9** — writes to bands 10..30
+are silently no-op'd (verified live via `_probe_eq_extra_bands.py`). The effective
+band count is 10.  All 10 are peaking EQ slots (no shelf flag in the wire format
+despite the manual's mention of LS/HS shelves on bands 1 & 10).
 
 ### Per-channel crossover — `DataID=32`, 8 bytes
 
@@ -114,17 +117,35 @@ Bands 11..30 are not exposed in any UI we've seen but are addressable.
 
 **Manual lists 6/12/18/24 dB/oct; firmware supports up to 48 dB/oct** (8 slope steps + Off).
 
-### Per-channel compressor / limiter — `DataID=35`
+### Per-channel compressor / limiter — `DataID=35` (cmd=0x2300+ch on the wire)
+
+leon's spec:
 
 ```
 [0..1]  attack_time_le16    (ms; small values 1..50)
-[2..3]  release_time_le16   (ms; 4-bit enum into {2,4,6,8,16,32}? — needs verification)
-[4]     threshold_u8        (dB; 0..255 maps to a dB range — likely (raw/10)-60 like volume)
+[2..3]  release_time_le16   (ms)
+[4]     threshold_u8        (dB)
 [5..7]  reserved / aux fields (unknown)
 ```
 
-**Not in the manual, not in our driver.** Per-output limiter is a documented DSP block in
-the firmware's data model — easy add once we verify the encoding.
+**Verified-live wire payload** (cmd=0x2300+ch, 2026-04-19 — distinctive
+byte injection lands at blob[278..285]):
+
+```
+[0..1]  all_pass_q_le16   (firmware default 420 — internal sidechain Q,
+                            not in leon's spec)
+[2..3]  attack_time_le16  (ms; firmware default 56)
+[4..5]  release_time_le16 (ms; firmware default 500)
+[6]     threshold_u8      (units not yet calibrated)
+[7]     enable            (1=on, 0=bypass — guess from one capture, not
+                            verified end-to-end)
+```
+
+**Implemented as `Device.set_compressor()` in `dsp408/device.py`.**  The
+wire encoding is verified (writes round-trip exactly through
+`read_channel_state()`), but compressor *behavior* (an actual
+attack/release/threshold curve fit on real audio) is still pending the
+loopback-rig probe.
 
 ### Per-channel name — `DataID=36`, 8 bytes ASCII
 
@@ -223,10 +244,16 @@ Ranked by value × ease, all reachable via USB by emitting the right `cmd_le32` 
    - **Action**: capture one channel's blob, lay it next to leon v1.23's `DataStruct_Output`,
      and find the offsets empirically. Then publish all fields to MQTT.
 2. **Per-channel phase invert / polarity** — single boolean register. In tigerapp it was
-   register `66+ch`. In leon v1.23 it's a field within the basic record (likely the
-   reserved bytes at indices 1 or 6 of the 8-byte record). Verify by toggling via the app
-   while sniffing USB.
-3. **Streaming on/off** — register 1555. Single 16-bit write.
+   register `66+ch`. **Resolved** — the polar field is byte[1] of the 8-byte channel
+   write payload (cmd=0x1F00..0x1F07) and lives at blob[247]; verified live via
+   Scarlett-loopback ±180° measurement. The earlier guess "byte[6] of the 8-byte
+   record" was tested separately (probe `_probe_eq_mode.py`) and disproved — that
+   byte stores at blob[252] but does NOT control EQ bypass either.
+3. **Streaming on/off** — register 1555. Single 16-bit write. Note: this just
+   toggles whether the GUI polls VU-meter data, not whether audio flows. The
+   meter-data wire format is still unknown — both `cmd=0x13` and `cmd=0x03`
+   reads return static bytes; need a fresh capture with audio actually playing
+   (see `captures-needed-from-windows.md` item #8).
 4. **Factory reset** — magic word `0xA5A6` to register 1567. One-line addition.
 5. **Load factory preset (1..6)** — magic word `0xB500 | n` to 1567. Six commands total.
 

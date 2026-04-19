@@ -33,27 +33,28 @@ sound-template dropdown writes this byte AND cascades crossover/EQ defaults.
 
 | Offset | Size | Field | Notes |
 |-------:|----:|-------|-------|
-| 0 | 240 | EQ bands | 30 bands × 8 bytes? Needs verification — leon has 31 bands here. **TBD: confirm band count by reading PEQ-tweak captures.** |
-| 240 | 6 | reserved/header | Possibly per-channel preamble (channel-id, version, flags). **TBD.** |
+| 0 | 80 | **EQ bands 0..9** | **Live-verified.** 10 × 8-byte records. Writes to bands 10..30 are silently no-op'd by the firmware even though the leon decompile shows 31 addressable slots (the GUI exposes only 10). |
+| 80 | 166 | unused / leon padding | Holds the bytes that would correspond to leon's bands 10..30; never observed to change in our firmware. |
 | **246** | **1** | **mute** (`en_bit`) | **Verified.** 0=muted, 1=audible. Note: INVERTED relative to leon's `mute` field semantics (leon: 1=mute, 0=audible). |
-| 247 | 1 | polar | **NEW.** 0/1 phase invert. Not currently parsed. |
+| 247 | 1 | polar | **Verified live** (Scarlett-loopback ±180° measurement). 0=normal, 1=phase invert. |
 | **248–249** | **2** | **gain_le16** | **Verified.** Raw `(dB×10)+600`, range 0..600 = -60..0 dB. |
-| **250–251** | **2** | **delay_le16** | **Verified.** Samples (or cm-step index). |
-| 252 | 1 | eq_mode | **NEW.** EQ enable/bypass flag, possibly. |
+| **250–251** | **2** | **delay_le16** | **Verified.** Samples — sample-accurate, capped at 359 taps. |
+| 252 | 1 | byte_252 | Semantic UNKNOWN. leon called this `eq_mode` but live probe `_probe_eq_mode.py` proved writes here round-trip but do NOT bypass EQ. Round-trips correctly; do not key automations on it. |
 | **253** | **1** | **spk_type** (was "subidx") | **Verified, renamed.** Speaker-role identifier 1..25. |
-| 254–255 | 2 | h_freq_le16 | **NEW.** HPF cutoff Hz (or table index). |
-| 256 | 1 | h_filter | **NEW.** HPF type: 0=Butterworth, 1=Bessel, 2=Linkwitz-Riley. |
-| 257 | 1 | h_level | **NEW.** HPF slope: 0..7 = 6/12/18/24/30/36/42/48 dB/oct, 8=Off. |
-| 258–259 | 2 | l_freq_le16 | **NEW.** LPF cutoff. |
-| 260 | 1 | l_filter | **NEW.** LPF type. |
-| 261 | 1 | l_level | **NEW.** LPF slope. |
-| 262–277 | 16 | mixer IN1..IN16 cells | **NEW.** One u8 per input source = level percent (0..100). 16-input firmware capacity exposes IN9..IN16 as zero on our 4-input device. |
-| 278–279 | 2 | allPassQ_le16 | **NEW.** Allpass filter Q. |
-| 280–281 | 2 | attackTime_le16 | **NEW.** Compressor attack ms. |
-| 282–283 | 2 | releaseTime_le16 | **NEW.** Compressor release ms. |
-| 284 | 1 | threshold | **NEW.** Compressor threshold (dB encoding TBD). |
-| 285 | 1 | linkgroup_num | **NEW.** Channel link/group index for ganged control. |
-| 286–293 | 8 | name | **NEW.** ASCII per-channel label (e.g. "TWEETER"). |
+| 254–255 | 2 | h_freq_le16 | **Verified live.** HPF cutoff Hz. |
+| 256 | 1 | h_filter | **Verified live.** HPF type: 0=Butterworth, 1=Bessel, 2=Linkwitz-Riley, 3=LR alias. |
+| 257 | 1 | h_level | **Verified live.** HPF slope: 0..7 = 6/12/18/24/30/36/42/48 dB/oct, 8=Off (bypass). |
+| 258–259 | 2 | l_freq_le16 | **Verified live.** LPF cutoff. |
+| 260 | 1 | l_filter | **Verified live.** LPF type. |
+| 261 | 1 | l_level | **Verified live.** LPF slope. |
+| 262–269 | **8** | mixer IN1..IN8 cells | **Verified live.** 8 cells (NOT 16 — leon's IN9..IN16 don't exist in our 4-in firmware). u8 0..255 levels (linear amplitude, allows boost above unity); GUI exposes only 0/100 toggles. |
+| 270–277 | 8 | comp_shadow | **Live-verified UNKNOWN.** Reads identical to the live compressor record but writes via cmd=0x2300+ch land at 278..285, never here. Probable read-only "factory default" shadow. Always reads `[164,1, 56,0, 244,1, 0, 0]` = (Q=420, A=56, R=500, T=0, Lk=0). |
+| **278–279** | **2** | **allPassQ_le16** | **Verified live 2026-04-19** by injection: cmd=0x2300+ch payload byte[0..1] lands here. |
+| **280–281** | **2** | **attackTime_le16** | **Verified live.** Compressor attack ms. |
+| **282–283** | **2** | **releaseTime_le16** | **Verified live.** Compressor release ms. |
+| **284** | **1** | **threshold** | **Verified live** as the cmd=0x2300 byte[6] target. Units (dBFS scale?) not yet calibrated. |
+| **285** | **1** | **linkgroup_num** | **Verified live.** Channel link/group index for ganged control. |
+| **286–293** | **8** | **name** | **Verified live 2026-04-19.** ASCII per-channel label, default `"        \x00"` (8 spaces + null). |
 | 294–295 | 2 | encryption flag / reserved | leon overwrites byte 288 with `Define.EncryptionFlag` when encrypted preset mode is on. We can ignore. |
 
 ## Leon's authoritative layout (for comparison / 31-band firmware variant)
@@ -137,9 +138,10 @@ clicks PEQ/crossover/compressor in the official app. **We have one capture file:
 
 Files to touch in `dsp408/`:
 - `device.py` — extend `parse_channel_state_blob()` to return all the new fields.
-  Output dict gains: `polar`, `eq_mode`, `h_freq`, `h_filter`, `h_level`, `l_freq`,
-  `l_filter`, `l_level`, `mixer` (list of 16), `attack_ms`, `release_ms`, `threshold`,
-  `link_group`, `name`, `eq_bands` (list of 10–31 dicts).
+  Output dict gains: `polar`, `byte_252` (semantic unknown — was `eq_mode`),
+  `h_freq`, `h_filter`, `h_level`, `l_freq`, `l_filter`, `l_level`,
+  `mixer` (list of 8), `attack_ms`, `release_ms`, `threshold`, `link_group`,
+  `name`, `eq_bands` (list of 10).
 - `protocol.py` — add HPF/LPF type enums, slope enum, EQ band enum.
 - Tests in `tests/test_controls.py` — synthetic blob fixtures for each new field.
 
@@ -164,9 +166,16 @@ In priority order:
    payload, OR a new opcode like `0x22` — TBD by sniffing.
 2. **Crossover** — `set_channel_crossover(ch, hpf=(type, freq, slope), lpf=...)`.
 3. **Streaming on/off** — `set_streaming(on: bool)`. From leon: register 1555.
+   Note: this only toggles whether the GUI polls VU meters; the meter
+   data wire format itself is still unknown. See
+   `captures-needed-from-windows.md` item #8.
 4. **Factory reset** — `factory_reset()` writes magic `0xA5A6` to register 1567.
 5. **Compressor** — `set_channel_compressor(ch, attack_ms, release_ms, threshold_db)`.
+   ✓ **Done**: `Device.set_compressor()` (cmd=0x2300+ch, payload at blob[278..285]).
+   Wire encoding verified live; behavior calibration pending.
 6. **PEQ bands** — `set_channel_eq_band(ch, band_idx, freq_hz, gain_db, q, type)`.
+   ✓ **Done**: `Device.set_eq_band()` (cmd=0x10000 + (band<<8) + channel,
+   Q × b4_byte ≈ 256 fixed-point reciprocal).
 
 Each one follows the same pattern: one `write_raw()` call with the right cmd + payload.
 

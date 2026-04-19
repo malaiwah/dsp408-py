@@ -2,6 +2,26 @@
 
 Verified against device `4EAA4B964C00` on the Pi, 2026-04-19, all 8 channels read.
 
+> **‼ POSTSCRIPT 2026-04-19 (later same day) — read this first.**
+> The "Updated layout" re-alignment hypothesis in the middle of this
+> document (which moved the compressor from 278..285 down to 270..277
+> and the name field from 286..293 down to 278..285) **was DISPROVED
+> by direct injection live-test**.  Writes via the compressor cmd
+> `0x2300+ch` land at blob[**278..285**] — exactly where the
+> originally-VERIFIED block at the top of this file said.  Bytes
+> 270..277 are a read-only shadow that holds identical default values
+> but ignores writes (best guess: the firmware's "factory reset
+> compressor" preload).  The name field is at blob[**286..293**] (8
+> ASCII bytes, default `"        \x00"` — eight spaces + null).
+>
+> Net result: the **first** block below ("What VERIFIED correctly") is
+> correct.  Skip the "Updated layout" + "Mixer cells at 262..277"
+> sections — they document an off-by-8 hypothesis we briefly believed
+> when sparse readback data made 270..277 look like the active
+> compressor record (it just happened to mirror the same defaults).
+> The current `dsp408/protocol.py` uses the live-verified offsets;
+> `OFF_COMP_SHADOW = 270` documents the read-only shadow region.
+
 ## What VERIFIED correctly
 
 - **`mute`** at offset 246: every channel reads `1` (live) — matches device state.
@@ -113,7 +133,10 @@ that point on.
 247       polar             ✓ NEW
 248–249   gain_le16         ✓
 250–251   delay_le16        ✓
-252       eq_mode           ✓ NEW
+252       byte_252          ✓ offset NEW (semantic UNKNOWN — earlier
+                            called `eq_mode` after the leon decompile but
+                            live probe `_probe_eq_mode.py` proved writes
+                            here do NOT bypass EQ)
 253       spk_type          ✓
 254–255   h_freq_le16       ✓ NEW
 256       h_filter          ✓ NEW
