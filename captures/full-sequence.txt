@@ -1,0 +1,67 @@
+Capture: full-sequence.pcapng
+Date: 2026-04-18
+App: DSP-408.exe V1.24
+
+Contents: long user session exercising routing, per-channel volume/mute,
+master volume/mute, channel linking, phase invert, EQ (reset / set bands /
+bypass / filter-type change), per-channel delay, and preset load. Intended
+as a broad "one capture covers everything" reference for protocol decode.
+
+Session sequence (in order, wall-clock start 20:01):
+
+Routing (input→channel matrix)
+  CH1: +IN1, +IN2, +IN3, +IN4
+  CH2: +IN1, +IN2, +IN3, +IN4
+  CH1: only IN1
+  CH2: only IN2
+  CH3: only IN1
+  CH4: only IN2
+  (all channels at 0 dB throughout the routing block)
+
+Per-channel volume
+  CH1 volume off
+  CH2 -30 dB
+  CH3 ~-45 dB
+  back to CH1..CH4 = 0 dB
+
+Per-channel mute
+  CH1 mute, CH1 unmute
+  CH2 mute, CH2 unmute
+
+Master volume (started at -20 dB)
+  master +6 dB
+  master -25 dB
+  master mute, master unmute
+  master back to -20 dB
+
+Channel linking
+  link CH1+CH2
+  link CH3+CH4
+
+Phase
+  CH1 180° (was 0°)
+  CH2 180° (was 0°)
+  CH1 and CH2 back to 0°
+
+EQ
+  reset EQ
+  first EQ band: 31 Hz, +12 dB
+  second EQ band: 65 Hz, -12 dB
+  click EQ bypass
+  switch high-pass filter type (at 20 Hz)
+  switch low-pass filter type (at 20000 Hz)
+
+Delay
+  CH1 delay = 8
+  CH2 delay = 8
+  CH3 delay = 4
+  CH4 delay = 4
+  all delays back to 0
+
+Presets
+  load Preset 0
+  load "Bureau" preset
+
+Trailing: played with mute.
+
+Same 80 80 80 ee protocol.
