@@ -609,9 +609,15 @@ class Device:
         if result is None:
             import logging
             logging.getLogger("dsp408.device").warning(
-                "get_channel(%d): could not parse 296-byte blob — "
-                "using cached defaults. First 16 bytes: %s",
-                channel, blob[:16].hex() if blob else "(empty)",
+                "get_channel(%d): could not parse 296-byte blob "
+                "(len=%d, blob[246:254]=%s blob[253]=0x%02x, "
+                "want subidx=0x%02x). First 16 bytes: %s",
+                channel,
+                len(blob) if blob else 0,
+                blob[246:254].hex() if len(blob) >= 254 else "(short)",
+                blob[253] if len(blob) >= 254 else 0,
+                CHANNEL_SUBIDX[channel],
+                blob[:16].hex() if blob else "(empty)",
             )
             return dict(self._channel_cache[channel])
 
