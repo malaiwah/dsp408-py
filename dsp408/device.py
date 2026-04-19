@@ -54,6 +54,7 @@ from dataclasses import dataclass
 
 from .config import friendly_name_for, load_aliases
 from .protocol import (
+    CAT_INPUT,
     CAT_PARAM,
     CAT_STATE,
     CHANNEL_SUBIDX,
@@ -65,14 +66,24 @@ from .protocol import (
     CMD_IDLE_POLL,
     CMD_MASTER,
     CMD_PRESET_NAME,
+    CMD_PRESET_SAVE_TRIGGER,
     CMD_READ_CHANNEL_BASE,
+    CMD_READ_INPUT_BASE,
     CMD_ROUTING_BASE,
+    CMD_ROUTING_HI_BASE,
     CMD_STATUS,
     CMD_WRITE_CHANNEL_BASE,
+    CMD_WRITE_CHANNEL_NAME_BASE,
     CMD_WRITE_COMPRESSOR_BASE,
     CMD_WRITE_CROSSOVER_BASE,
     CMD_WRITE_EQ_BAND_BASE,
+    CMD_WRITE_FULL_CHANNEL_HI_BASE,
+    CMD_WRITE_FULL_CHANNEL_LO_BASE,
     CMD_WRITE_GLOBAL,
+    CMD_WRITE_INPUT_DATAID10_BASE,
+    CMD_WRITE_INPUT_EQ_BAND_BASE,
+    CMD_WRITE_INPUT_MISC_BASE,
+    CMD_WRITE_INPUT_NOISEGATE_BASE,
     DIR_CMD,
     DIR_RESP,
     DIR_WRITE,
@@ -82,6 +93,7 @@ from .protocol import (
     EQ_GAIN_RAW_MAX,
     EQ_GAIN_RAW_MIN,
     EQ_Q_BW_CONSTANT,
+    INPUT_CHANNEL_COUNT,
     MASTER_LEVEL_MAX,
     MASTER_LEVEL_MIN,
     MASTER_LEVEL_OFFSET,
@@ -107,6 +119,7 @@ from .protocol import (
     OFF_SPK_TYPE,
     OFF_THRESHOLD,
     PID,
+    PRESET_SAVE_TRIGGER_BYTE,
     ROUTING_OFF,
     ROUTING_ON,
     VID,
@@ -1005,16 +1018,26 @@ class Device:
         """
         if not 0 <= output_idx <= 7:
             raise ValueError(f"output_idx must be in 0..7, got {output_idx}")
-        if len(levels) != 4:
-            raise ValueError(f"levels must have 4 entries, got {len(levels)}")
+        if len(levels) not in (4, 8):
+            raise ValueError(
+                f"levels must have 4 (IN1..IN4 — auto-padded for the "
+                f"non-existent IN5..IN8) or 8 (IN1..IN8) entries, got {len(levels)}")
         for i, lvl in enumerate(levels):
             if not 0 <= lvl <= 255:
                 raise ValueError(
                     f"levels[{i}]={lvl} out of u8 range [0, 255]")
+        # Per leon v1.23 source DataID=33 (cmd=0x2100+ch) is the IN1..IN8
+        # mixer (8 cells, not 4 as the Windows GUI ever exercises). Auto-
+        # pad if caller gave the legacy 4-cell signature — DSP-408 has
+        # only 4 physical inputs so cells 5..8 should always be zero
+        # anyway, but writing all 8 keeps us symmetric with the protocol.
+        full = list(levels) + [0] * (8 - len(levels))
         cmd = CMD_ROUTING_BASE + output_idx  # 0x2100..0x2107
-        # Bytes 4..7 are reserved/zero in the wire format.
-        payload = bytes(list(levels) + [0, 0, 0, 0])
-        self.write_raw(cmd=cmd, data=payload, category=CAT_PARAM)
+        self.write_raw(cmd=cmd, data=bytes(full), category=CAT_PARAM)
+        # leon also emits a parallel DataID=34 (cmd=0x2200+ch) write for
+        # IN9..IN16 — irrelevant on DSP-408 hardware (max 4 inputs) so we
+        # skip it by default. Callers can use set_routing_levels_high()
+        # if they want forward-compat with sibling DSP-816 firmware.
 
     # ── factory reset (magic-word write to cmd=0x2000) ─────────────────
     # Decoded 2026-04-19 from captures/reset_to_defaults.pcapng on the
@@ -1346,61 +1369,44 @@ class Device:
         threshold: int,
         *,
         all_pass_q: int = 420,
-        enable: bool = True,
+        linkgroup: int = 0,
     ) -> None:
         """Write per-channel compressor parameters (cmd=0x2300+ch).
 
         ⚠ **The compressor block is INERT in firmware v1.06**
-        (``MYDW-AV1.06``, the only firmware we've seen).  The wire write
-        is accepted, the 8-byte payload lands at blob[278..285] and
-        round-trips exactly through ``read_channel_state()`` — but the
-        audio engine never acts on the values.
+        (``MYDW-AV1.06``, the only firmware we've seen).  Three-way
+        confirmation — (a) live audio rig: no audible compression at
+        any parameter combination, (b) firmware disasm: no DSP code
+        path reads the compressor blob slot, (c) leon Android source:
+        the Windows GUI's toggle button just bundles a write with
+        defaults, no follow-up "engage" signal anywhere.
 
-        Six independent theories were tested live on the loopback rig
-        (2026-04-19, ``tests/loopback/_probe_compressor.py`` and
-        ``_probe_compressor_extreme.py``):
+        Wire encoding is decoded + round-trip-verified at blob[278..285]
+        per leon DataID=35:
 
-          * Full threshold sweep 0..255 with hot input (-3 dBFS), atk=1 ms,
-            rel=10 ms, enable=1 — output never moves more than ±0.05 dB.
-          * Enable byte tried as 0, 1, 2, 0x10, 0xFF — identical.
-          * Attack/release programmed across two decades (10..2000 ms) —
-            measured envelope time-constants stay at the audio system's
-            ~93 ms baseline, never tracking the programmed value.
-          * Toggling blob[252] (the formerly-named ``eq_mode`` byte) as
-            an alternate compressor enable — no effect.
-          * "Kicking" with a master-volume re-write after each
-            compressor frame, in case the audio engine needs a reload
-            trigger — no effect.
-          * Compressor on ch6 (the channel the Windows GUI toggled in
-            ``windows-04b-volumes-mute-presets.pcapng``) — wire
-            round-trips identically; ch6 isn't wired through our
-            Scarlett rig so audio not directly measurable.
+        ====  ================  ==================================
+        byte  field             meaning
+        ====  ================  ==================================
+        0..1  all_pass_q_le16   sidechain Q (firmware default 420)
+        2..3  attack_ms_le16    attack time (firmware default 56)
+        4..5  release_ms_le16   release time (firmware default 500)
+        6     threshold         u8, units uncalibrated
+        7     linkgroup_num     channel link/group index, 0=no link
+        ====  ================  ==================================
 
-        Best guess: the compressor is a planned-but-not-implemented
-        feature in v1.06.  The Windows GUI exposes the toggle, but it
-        may itself be a UI placeholder — the user who took the
-        windows-04b capture exercised the button without verifying any
-        audible compression.
-
-        This method is kept because:
-          1. The wire encoding is verified — useful for future firmware
-             revisions that may activate the block.
-          2. Reads come back exactly, so it's safe to round-trip values
-             through it for state preservation.
-          3. If a future firmware update activates compression, callers
-             will already have a working API surface.
+        Note: there is **no enable bit** in the wire format.  An earlier
+        revision of this method exposed an ``enable`` parameter that
+        wrote the linkgroup byte as 1; it had no audio effect either
+        way and was misleading.  Use ``linkgroup`` for what the byte
+        actually means (0=ungrouped, 1..N=member of group N).
 
         Args:
             channel:     0..7 (output index).
-            attack_ms:   compressor attack time in ms (u16; firmware default 56).
-            release_ms:  release time in ms (u16; firmware default 500).
-            threshold:   level above which compression engages (u8; units
-                         not yet calibrated — and irrelevant until the
-                         block is activated in firmware).
-            all_pass_q:  internal all-pass-filter Q (u16; firmware default
-                         420). Leave unchanged.
-            enable:      payload byte[7]: True=1, False=0. Wire-verified
-                         to round-trip; audio behavior not engaged.
+            attack_ms:   compressor attack time in ms (u16).
+            release_ms:  release time in ms (u16).
+            threshold:   level above which compression engages (u8).
+            all_pass_q:  internal sidechain Q (u16; firmware default 420).
+            linkgroup:   channel link-group index (u8; 0=ungrouped).
         """
         if not 0 <= channel <= 7:
             raise ValueError(f"channel must be in 0..7, got {channel}")
@@ -1412,15 +1418,341 @@ class Device:
             raise ValueError(f"threshold must fit u8, got {threshold}")
         if not 0 <= all_pass_q <= 0xFFFF:
             raise ValueError(f"all_pass_q must fit u16, got {all_pass_q}")
+        if not 0 <= linkgroup <= 0xFF:
+            raise ValueError(f"linkgroup must fit u8, got {linkgroup}")
         payload = bytes([
             all_pass_q & 0xFF, (all_pass_q >> 8) & 0xFF,
             attack_ms & 0xFF, (attack_ms >> 8) & 0xFF,
             release_ms & 0xFF, (release_ms >> 8) & 0xFF,
             threshold & 0xFF,
-            1 if enable else 0,
+            linkgroup & 0xFF,
         ])
         cmd = CMD_WRITE_COMPRESSOR_BASE + channel
         self.write_raw(cmd=cmd, data=payload, category=CAT_PARAM)
+
+    # ── per-channel name (DataID=36, cmd=0x2400+ch) ────────────────────
+    def set_channel_name(self, channel: int, name: str) -> None:
+        """Write the per-output-channel name (8-byte ASCII).
+
+        Per leon v1.23 ``DataOptUtil.java:1138-1147`` (DataID=36) — the
+        payload is exactly 8 raw bytes from the name field, no length
+        prefix or terminator. UTF-8 strings are sent as-is up to 8
+        bytes; shorter names are zero-padded.
+
+        Lands at ``blob[OFF_NAME .. OFF_NAME+8]`` (offsets 286..293).
+
+        Args:
+            channel: 0..7 (output index).
+            name:    String to write. Encoded as ASCII (errors ignored),
+                     truncated or zero-padded to exactly 8 bytes.
+        """
+        if not 0 <= channel <= 7:
+            raise ValueError(f"channel must be in 0..7, got {channel}")
+        encoded = name.encode("ascii", errors="ignore")[:8]
+        payload = encoded + b"\x00" * (8 - len(encoded))
+        cmd = CMD_WRITE_CHANNEL_NAME_BASE + channel
+        self.write_raw(cmd=cmd, data=payload, category=CAT_PARAM)
+
+    # ── per-channel routing (extended: 8 cells + IN9..IN16 mirror) ─────
+    def set_routing_levels_high(
+        self,
+        output_idx: int,
+        levels: list[int] | tuple[int, ...],
+    ) -> None:
+        """Write the IN9..IN16 mixer cells for one output (cmd=0x2200+ch).
+
+        Per leon v1.23 DataID=34. On DSP-408 hardware these inputs
+        don't physically exist — but writing them keeps us symmetric
+        with the firmware's data model and forward-compatible with the
+        sibling DSP-816 chip. Most users want :meth:`set_routing_levels`
+        (which handles IN1..IN8) instead.
+        """
+        if not 0 <= output_idx <= 7:
+            raise ValueError(f"output_idx must be in 0..7, got {output_idx}")
+        if len(levels) != 8:
+            raise ValueError(f"levels must have 8 entries, got {len(levels)}")
+        for i, lvl in enumerate(levels):
+            if not 0 <= lvl <= 255:
+                raise ValueError(
+                    f"levels[{i}]={lvl} out of u8 range [0, 255]")
+        cmd = CMD_ROUTING_HI_BASE + output_idx  # 0x2200..0x2207
+        self.write_raw(cmd=cmd, data=bytes(levels), category=CAT_PARAM)
+
+    # ── input-side processing (DataType=3, cat=0x03) ───────────────────
+    def read_input_state(self, input_ch: int) -> bytes:
+        """Read the 288-byte per-input-channel state blob.
+
+        Mirror of :meth:`read_channel_state` but for the input side.
+        ``cmd = (0x77 << 8) | input_ch`` with cat=0x03.
+
+        DSP-408 has 4 RCA + 4 high-level inputs (8 slots in the
+        firmware data model; cells 6+ may be aux/BT/unused). The
+        288-byte response carries:
+          * EQ bands (15 max per leon spec; layout has a 6/8 stride
+            quirk — see ``tests/loopback/_probe_input_writes.py``)
+          * INPUT MISC at blob[70..77] (DataID=9): feedback, polar,
+            mode, mute, delay_le16, volume
+          * Unknown subsystem at blob[78..85] (DataID=10)
+          * Input noisegate at blob[86..93] (DataID=11)
+          * XOR checksum at blob[286]
+        """
+        if not 0 <= input_ch < INPUT_CHANNEL_COUNT:
+            raise ValueError(
+                f"input_ch must be in 0..{INPUT_CHANNEL_COUNT - 1}, "
+                f"got {input_ch}")
+        # CMD_READ_INPUT_BASE is 0x0077 (low byte); the wire cmd is
+        # 0x7700+ch — same shift-left convention as read_channel_state.
+        cmd = (CMD_READ_INPUT_BASE << 8) | (input_ch & 0xFF)
+        reply = self.read_raw(cmd=cmd, category=CAT_INPUT)
+        return reply.payload
+
+    def set_input(
+        self,
+        input_ch: int,
+        *,
+        feedback: int = 0,
+        polar: bool = False,
+        mode: int = 0,
+        muted: bool = False,
+        delay_samples: int = 0,
+        volume: int = 0,
+        spare: int = 0,
+    ) -> None:
+        """Write input MISC (cmd=0x0900+ch cat=0x03, DataID=9).
+
+        Lands at blob[70..77] of the input-state blob (verified live
+        2026-04-19). 8-byte payload per leon source field labels:
+
+        ====  ============  ====================================
+        byte  field         meaning (per leon — uncalibrated)
+        ====  ============  ====================================
+        0     feedback      flag; semantics unverified
+        1     polar         0=normal, 1=phase invert
+        2     mode          0=??, 1=??
+        3     muted         0=audible, 1=muted
+        4..5  delay_le16    delay (samples or cm-step?)
+        6     volume        u8; semantics unverified
+        7     spare         always 0 in our writes
+        ====  ============  ====================================
+
+        ⚠ Field semantics labeled per leon's source but **not yet
+        calibrated against audio**. polar/muted/delay should mirror
+        the per-output equivalents but verify on the rig before
+        trusting individual fields.
+        """
+        if not 0 <= input_ch < INPUT_CHANNEL_COUNT:
+            raise ValueError(
+                f"input_ch must be in 0..{INPUT_CHANNEL_COUNT - 1}, "
+                f"got {input_ch}")
+        for nm, v, lo, hi in [
+            ("feedback", feedback, 0, 0xFF),
+            ("mode", mode, 0, 0xFF),
+            ("delay_samples", delay_samples, 0, 0xFFFF),
+            ("volume", volume, 0, 0xFF),
+            ("spare", spare, 0, 0xFF),
+        ]:
+            if not lo <= v <= hi:
+                raise ValueError(f"{nm}={v} out of [{lo}, {hi}]")
+        payload = bytes([
+            feedback & 0xFF,
+            1 if polar else 0,
+            mode & 0xFF,
+            1 if muted else 0,
+            delay_samples & 0xFF, (delay_samples >> 8) & 0xFF,
+            volume & 0xFF,
+            spare & 0xFF,
+        ])
+        cmd = CMD_WRITE_INPUT_MISC_BASE | (input_ch & 0xFF)
+        self.write_raw(cmd=cmd, data=payload, category=CAT_INPUT)
+
+    def set_input_eq_band(
+        self,
+        input_ch: int,
+        band: int,
+        freq_hz: int,
+        gain_db: float,
+        q: float | None = None,
+        *,
+        bandwidth_byte: int | None = None,
+    ) -> None:
+        """Write one parametric-EQ band on one input channel.
+
+        Mirror of :meth:`set_eq_band` but for the input side. Up to
+        15 bands per input per leon spec (DataID=0..14); writes to
+        higher band indices may silently no-op (not verified).
+
+        ``cmd = (band << 8) | input_ch`` with cat=0x03.
+
+        Note: input EQ bands have a layout quirk — bands 0..5 use 8-byte
+        stride starting at offset 0, but the structure shifts after that
+        in ways we haven't fully decoded. Per-band writes round-trip
+        through the read but the offset map is approximate. See
+        ``tests/loopback/_probe_input_writes.py``.
+        """
+        if not 0 <= input_ch < INPUT_CHANNEL_COUNT:
+            raise ValueError(
+                f"input_ch must be in 0..{INPUT_CHANNEL_COUNT - 1}, "
+                f"got {input_ch}")
+        # Reserve DataID 9, 10, 11 for MISC/unknown/noisegate respectively;
+        # leon's spec puts EQ bands at DataID 0..14 minus those.
+        if not 0 <= band <= 14:
+            raise ValueError(f"band must be in 0..14, got {band}")
+        if band in (9, 10, 11):
+            raise ValueError(
+                f"band {band} collides with MISC/unknown/noisegate "
+                f"DataIDs; use set_input/set_input_noisegate instead")
+        if not 0 <= freq_hz <= 0xFFFF:
+            raise ValueError(f"freq_hz must fit u16, got {freq_hz}")
+        if q is not None and bandwidth_byte is not None:
+            raise ValueError("pass q OR bandwidth_byte, not both")
+        if bandwidth_byte is None:
+            b4 = self.q_to_bandwidth_byte(q) if q is not None else 0x34
+        else:
+            if not 1 <= bandwidth_byte <= 255:
+                raise ValueError(
+                    f"bandwidth_byte must be 1..255, got {bandwidth_byte}")
+            b4 = bandwidth_byte
+        from .protocol import EQ_GAIN_RAW_MAX, EQ_GAIN_RAW_MIN
+        raw = max(EQ_GAIN_RAW_MIN, min(EQ_GAIN_RAW_MAX,
+                                       round(gain_db * 10 + CHANNEL_VOL_OFFSET)))
+        payload = bytes([
+            freq_hz & 0xFF, (freq_hz >> 8) & 0xFF,
+            raw & 0xFF, (raw >> 8) & 0xFF,
+            b4, 0, 0, 0,
+        ])
+        cmd = CMD_WRITE_INPUT_EQ_BAND_BASE | (band << 8) | (input_ch & 0xFF)
+        self.write_raw(cmd=cmd, data=payload, category=CAT_INPUT)
+
+    def set_input_noisegate(
+        self,
+        input_ch: int,
+        threshold: int,
+        attack: int,
+        knee: int,
+        release: int,
+        config: int = 0,
+    ) -> None:
+        """Write input noisegate parameters (cmd=0x0B00+ch cat=0x03, DataID=11).
+
+        Lands at blob[86..93] of the input-state blob (verified live
+        2026-04-19 via distinctive-byte injection — output 8 bytes
+        appeared exactly).
+
+        Field labels follow leon source; semantic units (dB? ms?
+        samples?) are **not yet calibrated against audio behavior**.
+        Test on the rig before relying on specific values.
+
+        Args:
+            input_ch:  0..7
+            threshold: u8
+            attack:    u8 (probably ms or samples)
+            knee:      u8
+            release:   u8
+            config:    u8 — flags / mode bits
+        """
+        if not 0 <= input_ch < INPUT_CHANNEL_COUNT:
+            raise ValueError(
+                f"input_ch must be in 0..{INPUT_CHANNEL_COUNT - 1}, "
+                f"got {input_ch}")
+        for nm, v in (("threshold", threshold), ("attack", attack),
+                      ("knee", knee), ("release", release),
+                      ("config", config)):
+            if not 0 <= v <= 0xFF:
+                raise ValueError(f"{nm}={v} out of u8 range")
+        payload = bytes([threshold, attack, knee, release, config, 0, 0, 0])
+        cmd = CMD_WRITE_INPUT_NOISEGATE_BASE | (input_ch & 0xFF)
+        self.write_raw(cmd=cmd, data=payload, category=CAT_INPUT)
+
+    def write_input_dataid10(self, input_ch: int, payload: bytes) -> None:
+        """Escape hatch: write 8 bytes via input DataID=10 (cmd=0x0A00+ch).
+
+        Lands at blob[78..85] of the input blob. **Subsystem semantic
+        unknown** — not documented in the leon Android source, but our
+        live probe confirmed writes round-trip exactly. Possibly an
+        input compressor or per-input limiter slot.
+        """
+        if not 0 <= input_ch < INPUT_CHANNEL_COUNT:
+            raise ValueError(
+                f"input_ch must be in 0..{INPUT_CHANNEL_COUNT - 1}, "
+                f"got {input_ch}")
+        if len(payload) != 8:
+            raise ValueError(f"payload must be 8 bytes, got {len(payload)}")
+        cmd = CMD_WRITE_INPUT_DATAID10_BASE | (input_ch & 0xFF)
+        self.write_raw(cmd=cmd, data=bytes(payload), category=CAT_INPUT)
+
+    # ── full-channel state write + preset ops ──────────────────────────
+    @staticmethod
+    def _full_channel_cmd(channel: int) -> int:
+        """Return the cmd code for a 296-byte full-channel-state write."""
+        if 0 <= channel <= 3:
+            return CMD_WRITE_FULL_CHANNEL_LO_BASE | channel  # 0x10000..0x10003
+        if 4 <= channel <= 7:
+            return CMD_WRITE_FULL_CHANNEL_HI_BASE + (channel - 4)  # 0x04..0x07
+        raise ValueError(f"channel must be in 0..7, got {channel}")
+
+    def set_full_channel_state(self, channel: int, blob: bytes) -> None:
+        """Write the entire 296-byte channel-state blob in one frame.
+
+        Decoded from ``captures/load_loaddisk_save_preset_bureau.pcapng``
+        (the GUI's "Load from disk" action). Useful for atomic state
+        backup/restore: ``read_channel_state`` + modify + this method.
+
+        ⚠ Cmd encoding has a TRAP: channels 0..3 use cmd=0x10000+ch,
+        channels 4..7 use cmd=0x04+(ch-4). The latter range collides
+        with ``CMD_GET_INFO=0x04`` for READS (dir=a2, len=8) — the
+        firmware disambiguates by direction + payload length, but
+        anyone reading raw frames needs to know this.
+        """
+        if len(blob) != 296:
+            raise ValueError(f"blob must be 296 bytes, got {len(blob)}")
+        cmd = self._full_channel_cmd(channel)
+        self.write_raw(cmd=cmd, data=bytes(blob), category=CAT_PARAM)
+
+    def save_preset(self, name: str) -> None:
+        """Commit the current device state to internal flash under ``name``.
+
+        Replays the GUI's "Save to DSP" sequence from
+        ``captures/load_loaddisk_save_preset_bureau.pcapng``:
+
+          1. Send the preset-save trigger ``cmd=0x34 cat=0x09 data=01`` —
+             this is what tells the firmware to start a save transaction.
+          2. Set preset name to ``name`` (cmd=0x00).
+          3. Bulk-write all 8 channels' full state via
+             :meth:`set_full_channel_state` (cmd=0x10000..0x10003 then
+             cmd=0x04..0x07 with 296-byte payloads).
+
+        ⚠ Destructive on the chosen slot. The firmware appears to
+        commit to flash (per the cmd=0x34 trigger and the ~430 ms
+        latency we see on similar magic-write commands). Testing on
+        the rig is needed to confirm persistence across power-cycles.
+        """
+        # Step 1: tell firmware "begin save transaction"
+        self.write_raw(cmd=CMD_PRESET_SAVE_TRIGGER,
+                       data=bytes([PRESET_SAVE_TRIGGER_BYTE]),
+                       category=CAT_STATE)
+        # Step 2: write the new preset name (15-byte slot, zero-padded)
+        encoded = name.encode("ascii", errors="ignore")[:15]
+        name_payload = encoded + b"\x00" * (15 - len(encoded)) + b"\x00"
+        self.write_raw(cmd=CMD_PRESET_NAME, data=name_payload, category=CAT_STATE)
+        # Step 3: dump full channel state for all 8 channels
+        for ch in range(8):
+            blob = self.read_channel_state(ch)
+            self.set_full_channel_state(ch, bytes(blob))
+
+    def load_preset_by_name(self, name: str) -> None:
+        """Load a named preset from internal flash by setting its name.
+
+        From ``load_loaddisk_save_preset_bureau.pcapng`` the GUI's
+        "Load Preset" action just writes the preset name (cmd=0x00).
+        The firmware looks up the slot internally and swaps state.
+        Lightweight — no bulk channel writes required.
+
+        If the name doesn't match a saved slot, behavior is unknown
+        (the firmware may silently keep current state).
+        """
+        encoded = name.encode("ascii", errors="ignore")[:15]
+        payload = encoded + b"\x00" * (15 - len(encoded)) + b"\x00"
+        self.write_raw(cmd=CMD_PRESET_NAME, data=payload, category=CAT_STATE)
 
     # ── one-shot snapshot ──────────────────────────────────────────────
     def snapshot(self) -> DeviceInfo:

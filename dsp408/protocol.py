@@ -53,9 +53,13 @@ DIR_WRITE = 0xA1      # host → device, WRITE / firmware
 DIR_RESP = 0x53       # device → host, READ reply
 DIR_WRITE_ACK = 0x51  # device → host, WRITE / firmware ack
 
-# Category byte (byte[7])
+# Category byte (byte[7]) — leon's code calls this "DataType":
+#   3 = MUSIC  (input-side processing: input EQ, MISC, noisegate)
+#   4 = OUTPUT (per-output channel processing: output EQ, crossover, etc.)
+#   9 = SYSTEM (preset name, master, identity, firmware, magic registers)
+CAT_INPUT = 0x03      # input processing — verified live 2026-04-19
 CAT_STATE = 0x09      # connect, get_info, preset name, status, idle poll, firmware blocks
-CAT_PARAM = 0x04      # parameter read/write (0x77NN, 0x1fNN, 0x2000)
+CAT_PARAM = 0x04      # output parameter read/write (0x77NN, 0x1fNN, 0x2000, etc.)
 
 
 def category_hint(cmd: int) -> int:
@@ -73,7 +77,7 @@ def category_hint(cmd: int) -> int:
         return CAT_PARAM
     if cmd == 0x2000:
         return CAT_PARAM
-    if 0x2100 <= cmd <= 0x21FF:
+    if 0x2100 <= cmd <= 0x24FF:  # routing/compressor/name + future 0x22NN/0x23NN/0x24NN
         return CAT_PARAM
     # EQ band writes 0x10000..0x10FFF and crossover 0x12000..0x12007
     if 0x10000 <= cmd <= 0x12FFF:
@@ -269,19 +273,86 @@ CMD_ROUTING_BASE = 0x2100
 # Same cmd code as CMD_GLOBAL_0x05; alias for self-documenting call sites.
 CMD_MASTER = 0x0005
 
-CMD_WRITE_GLOBAL = 0x2000       # writes global params (layout TBD; observed
-                                # but never decoded — kept for completeness)
+CMD_WRITE_GLOBAL = 0x2000       # writes global params; the ONE captured use
+                                # is the factory-reset magic word (cat=0x04
+                                # payload=06 1f 00 00 20 4e 00 01) — see
+                                # Device.factory_reset()
 
 # Per-channel compressor write (0x2300..0x2307 = ch1..ch8). 8-byte payload
-# observed once in captures/windows-04b-volumes-mute-presets.pcapng:
-#     [0..1]  all_pass_q_le16   (mirrors blob[270..271])
-#     [2..3]  attack_ms_le16    (mirrors blob[272..273])
-#     [4..5]  release_ms_le16   (mirrors blob[274..275])
-#     [6]     threshold         (mirrors blob[276])
-#     [7]     enable            (1 = compressor on, 0 = bypass — guess)
-# NOT yet driven by the high-level API; live activation/curve fit still
-# pending (compressor probe is still on the loopback-rig backlog).
+# decoded from captures/windows-04b-volumes-mute-presets.pcapng + verified
+# live to land at blob[278..285]; per leon v1.23 source the field layout is:
+#     [0..1]  all_pass_q_le16   (sidechain Q; firmware default 420)
+#     [2..3]  attack_ms_le16    (firmware default 56)
+#     [4..5]  release_ms_le16   (firmware default 500)
+#     [6]     threshold         (units uncalibrated)
+#     [7]     linkgroup_num     (channel link/group index, 0=no link)
+# Note: per leon source there's NO enable bit in the wire format — the
+# block is "always on" but inert in firmware v1.06 (live test confirms
+# no audio change at any parameter combo, three-way confirmation:
+# wire decode + firmware disasm + audio rig).
 CMD_WRITE_COMPRESSOR_BASE = 0x2300
+
+# Per-channel name write (0x2400..0x2407 = ch1..ch8). 8 bytes ASCII,
+# zero-padded. Per leon v1.23 DataOptUtil.java:1138-1147 (DataID=36).
+# Lands at blob[286..293] (default = 8 spaces + 0x00 trailing).
+CMD_WRITE_CHANNEL_NAME_BASE = 0x2400
+
+# Per-channel mixer SECOND HALF write (0x2200..0x2207 = ch1..ch8).
+# 8 bytes for IN9..IN16 (mirror of CMD_ROUTING_BASE=0x21NN which holds
+# IN1..IN8). Per leon v1.23 DataID=34. On DSP-408 hardware (max 4
+# physical inputs) cells 9..16 are always zero, but writing them keeps
+# us symmetric with the protocol — and forward-compatible with the
+# sibling DSP-816 firmware.
+CMD_ROUTING_HI_BASE = 0x2200
+
+# ── Input-side processing (DataType=3 = MUSIC, cat=0x03) ────────────────
+# Verified live 2026-04-19: cat=0x03 is wire-supported on USB. Reads
+# return 288-byte input-state blobs; writes target individual subsystems
+# via DataID encoding: cmd = (DataID << 8) | input_channel.
+#
+# Discovered DataID slots (live-verified blob landings):
+#   DataID=0..8, 12..14: input EQ bands  (15 max per leon spec; live
+#                                          stride is variable — bands 0..5
+#                                          land in offsets 0..47 (8 bytes
+#                                          each), then layout shifts; 30
+#                                          bands of leon padding follow)
+#   DataID=9          : input MISC (8-byte basic record at blob[70..77]):
+#                          [feedback, polar, mode, mute, delay_le16,
+#                           volume, spare]  (per leon source; field
+#                           semantics not yet calibrated against audio)
+#   DataID=10         : 8 bytes at blob[78..85] (subsystem unknown — not
+#                          documented in leon source; possibly input
+#                          compressor or a per-input limiter)
+#   DataID=11         : input NOISEGATE (8 bytes at blob[86..93]):
+#                          [threshold, attack, knee, release, config, ...]
+#                          per leon source.
+#   DataID=119 (0x77) : full input-channel state read (288 bytes)
+CMD_READ_INPUT_BASE          = 0x0077  # cmd = (0x77 << 8) | input_ch
+CMD_WRITE_INPUT_EQ_BAND_BASE = 0x0000  # cmd = (band << 8) | input_ch
+CMD_WRITE_INPUT_MISC_BASE    = 0x0900  # cmd = 0x0900 | input_ch
+CMD_WRITE_INPUT_DATAID10_BASE = 0x0A00 # cmd = 0x0A00 | input_ch (semantics TBD)
+CMD_WRITE_INPUT_NOISEGATE_BASE = 0x0B00  # cmd = 0x0B00 | input_ch
+
+INPUT_CHANNEL_COUNT = 8  # firmware exposes 8 input slots (DSP-408 hw has 4
+                         # RCA + 4 high-level; cells 6+ may be aux/BT/unused)
+INPUT_BLOB_SIZE = 288    # response length to cmd=0x77NN cat=0x03
+
+# Full-channel-state write (296 bytes, output side). Per Windows
+# preset-load capture (load_loaddisk_save_preset_bureau.pcapng), the GUI
+# uses TWO different cmd codes for "load preset from disk":
+#   - Channels 0..3: cmd = 0x10000 | ch    (cmd=0x10000..0x10003)
+#   - Channels 4..7: cmd = 0x04 | (ch-4)   (cmd=0x04..0x07)
+# The cmd=0x04..0x07 range collides with CMD_GET_INFO=0x04 for READS
+# (dir=a2, len=8) — disambiguated by direction + payload length.
+CMD_WRITE_FULL_CHANNEL_LO_BASE = 0x10000  # ch 0..3
+CMD_WRITE_FULL_CHANNEL_HI_BASE = 0x0004   # ch 4..7 (= 4 + (ch-4))
+
+# Save preset trigger (per Windows preset-save capture): the GUI emits
+# a dir=a1 WRITE to cmd=0x34 cat=0x09 with a single-byte 0x01 payload
+# BEFORE the bulk-channel writes that commit state to internal flash.
+# Without this trigger, the bulk writes appear to land in RAM only.
+CMD_PRESET_SAVE_TRIGGER = 0x34
+PRESET_SAVE_TRIGGER_BYTE = 0x01
 
 # Per-channel HPF + LPF crossover writes (0x12000..0x12007 = ch1..ch8).
 # 8-byte payload mirrors blob[254..261] exactly:
@@ -441,9 +512,20 @@ NAME_LEN        = 8
 FILTER_TYPE_BW = 0
 FILTER_TYPE_BESSEL = 1
 FILTER_TYPE_LR = 2
-FILTER_TYPE_NAMES = ("Butterworth", "Bessel", "Linkwitz-Riley")
-# Filter-type byte 3 also produces a Linkwitz-Riley response (alias of
-# type 2); see tests/loopback/test_crossover_characterization.py.
+FILTER_TYPE_NAMES = (
+    "Butterworth",       # 0
+    "Bessel",            # 1
+    "Linkwitz-Riley",    # 2
+    "Linkwitz-Riley",    # 3 — verified live as a duplicate of type 2
+                         #     (point-by-point max diff 0.21 dB across a
+                         #     7-frequency sweep at fc=2 kHz / slope=24).
+                         #     The Windows GUI's "Defeat" button writes
+                         #     type=3 *and* moves freq to the band edge
+                         #     (20 kHz LPF, 20 Hz HPF) — making the
+                         #     filter inaudible by sleight of hand, NOT
+                         #     true bypass. Real bypass is `slope=8`.
+)
+FILTER_TYPE_LR_ALIAS = 3
 
 # Slope enum: index → "6 dB/oct" / "12 dB/oct" / ... / "Off"
 SLOPE_NAMES = (
@@ -527,8 +609,23 @@ __all__ = [
     "CMD_WRITE_CHANNEL_BASE",
     "CMD_WRITE_GLOBAL",
     "CMD_WRITE_COMPRESSOR_BASE",
+    "CMD_WRITE_CHANNEL_NAME_BASE",
+    "CMD_ROUTING_HI_BASE",
     "CMD_WRITE_CROSSOVER_BASE",
     "CMD_WRITE_EQ_BAND_BASE",
+    "CMD_WRITE_FULL_CHANNEL_LO_BASE",
+    "CMD_WRITE_FULL_CHANNEL_HI_BASE",
+    "CMD_PRESET_SAVE_TRIGGER",
+    "PRESET_SAVE_TRIGGER_BYTE",
+    "CAT_INPUT",
+    "CMD_READ_INPUT_BASE",
+    "CMD_WRITE_INPUT_EQ_BAND_BASE",
+    "CMD_WRITE_INPUT_MISC_BASE",
+    "CMD_WRITE_INPUT_DATAID10_BASE",
+    "CMD_WRITE_INPUT_NOISEGATE_BASE",
+    "INPUT_CHANNEL_COUNT",
+    "INPUT_BLOB_SIZE",
+    "FILTER_TYPE_LR_ALIAS",
     "EQ_BAND_COUNT",
     "EQ_Q_BW_CONSTANT",
     "EQ_DEFAULT_FREQS_HZ",

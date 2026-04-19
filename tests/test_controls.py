@@ -879,3 +879,162 @@ def test_set_eq_band_default_freqs_match_blob() -> None:
     # The fixed-point Q constant is exactly 256 (= 2⁸), confirming the
     # firmware's reciprocal-Q encoding.
     assert Device.EQ_Q_BW_CONSTANT == 256.0
+
+
+# ── per-channel name (cmd=0x2400+ch, DataID=36) ──────────────────────────
+def test_set_channel_name_pads_to_8_bytes() -> None:
+    """set_channel_name encodes ASCII, pads with NUL to exactly 8 bytes."""
+    d, t = _make_device()
+    d.set_channel_name(0, "TWEETER")
+    cmd, cat, _, _ = _last_meta(t)
+    assert cmd == 0x2400
+    assert cat == CAT_PARAM
+    assert _last_payload(t) == b"TWEETER\x00"
+
+
+def test_set_channel_name_truncates_long_input() -> None:
+    """Names longer than 8 chars are truncated."""
+    d, t = _make_device()
+    d.set_channel_name(7, "WAY_TOO_LONG_NAME")
+    cmd, _, _, _ = _last_meta(t)
+    assert cmd == 0x2407
+    assert _last_payload(t) == b"WAY_TOO_"
+
+
+def test_set_channel_name_rejects_bad_channel() -> None:
+    d, _ = _make_device()
+    with pytest.raises(ValueError):
+        d.set_channel_name(8, "X")
+    with pytest.raises(ValueError):
+        d.set_channel_name(-1, "X")
+
+
+# ── compressor: linkgroup byte (was misnamed `enable`) ──────────────────
+def test_set_compressor_writes_linkgroup_at_byte_7() -> None:
+    """byte[7] of cmd=0x2300+ch is linkgroup_num per leon source.
+
+    Earlier API exposed it as `enable` (0/1); now it's `linkgroup` so
+    the user can pick any group number, not just on/off."""
+    d, t = _make_device()
+    d.set_compressor(channel=0, attack_ms=20, release_ms=300,
+                     threshold=12, all_pass_q=420, linkgroup=2)
+    cmd, cat, _, _ = _last_meta(t)
+    assert cmd == 0x2300
+    assert cat == CAT_PARAM
+    payload = _last_payload(t)
+    assert payload[6] == 12          # threshold
+    assert payload[7] == 2           # linkgroup_num
+
+
+# ── routing: 4 OR 8 cells ──────────────────────────────────────────────
+def test_set_routing_levels_4_cells_pads_to_8() -> None:
+    """Legacy 4-cell signature pads to 8-cell payload (per leon DataID=33)."""
+    d, t = _make_device()
+    d.set_routing_levels(0, [100, 50, 0, 25])
+    payload = _last_payload(t)
+    assert len(payload) == 8
+    assert list(payload) == [100, 50, 0, 25, 0, 0, 0, 0]
+
+
+def test_set_routing_levels_8_cells_writes_all() -> None:
+    """8-cell signature writes IN1..IN8 directly."""
+    d, t = _make_device()
+    d.set_routing_levels(0, [10, 20, 30, 40, 50, 60, 70, 80])
+    payload = _last_payload(t)
+    assert list(payload) == [10, 20, 30, 40, 50, 60, 70, 80]
+
+
+def test_set_routing_levels_high_writes_in9_in16() -> None:
+    """set_routing_levels_high writes IN9..IN16 at cmd=0x2200+ch (DataID=34)."""
+    d, t = _make_device()
+    d.set_routing_levels_high(0, [1, 2, 3, 4, 5, 6, 7, 8])
+    cmd, _, _, _ = _last_meta(t)
+    assert cmd == 0x2200
+    assert list(_last_payload(t)) == [1, 2, 3, 4, 5, 6, 7, 8]
+
+
+# ── input processing (DataType=3 = MUSIC, cat=0x03) ──────────────────────
+def test_set_input_misc_payload_layout() -> None:
+    """set_input writes the leon-spec MISC layout to cmd=0x0900+ch cat=0x03."""
+    d, t = _make_device()
+    d.set_input(input_ch=2, feedback=0xAA, polar=True, mode=1, muted=True,
+                delay_samples=10, volume=99, spare=0)
+    cmd, cat, _, _ = _last_meta(t)
+    assert cmd == 0x0902
+    assert cat == 0x03  # CAT_INPUT
+    payload = _last_payload(t)
+    assert payload == bytes([0xAA, 1, 1, 1, 10, 0, 99, 0])
+
+
+def test_set_input_eq_band_encoding() -> None:
+    """Input EQ band write: cmd=(band<<8)|input_ch with cat=0x03."""
+    d, t = _make_device()
+    d.set_input_eq_band(input_ch=3, band=5, freq_hz=1000, gain_db=+6.0, q=4.5)
+    cmd, cat, _, _ = _last_meta(t)
+    assert cmd == 0x0503  # band 5, input ch 3
+    assert cat == 0x03
+    payload = _last_payload(t)
+    # freq=1000, raw_gain = +6×10+600 = 660 = 0x0294, b4 = round(256/4.5) = 57
+    assert payload[:4] == bytes.fromhex("e803" + "9402")
+    assert payload[4] == round(256 / 4.5)
+
+
+def test_set_input_eq_band_rejects_misc_collisions() -> None:
+    """DataIDs 9, 10, 11 are MISC/unknown/noisegate — not EQ bands."""
+    d, _ = _make_device()
+    for bad_band in (9, 10, 11):
+        with pytest.raises(ValueError, match="collides"):
+            d.set_input_eq_band(0, bad_band, 1000, 0.0)
+
+
+def test_set_input_noisegate_payload_layout() -> None:
+    """set_input_noisegate writes 5 named bytes + 3 zero pad to cmd=0x0B00+ch."""
+    d, t = _make_device()
+    d.set_input_noisegate(input_ch=1, threshold=20, attack=5, knee=10,
+                          release=50, config=0x80)
+    cmd, cat, _, _ = _last_meta(t)
+    assert cmd == 0x0B01
+    assert cat == 0x03
+    assert list(_last_payload(t)) == [20, 5, 10, 50, 0x80, 0, 0, 0]
+
+
+def test_write_input_dataid10_escape_hatch() -> None:
+    """write_input_dataid10 sends 8 bytes verbatim to cmd=0x0A00+ch cat=0x03."""
+    d, t = _make_device()
+    d.write_input_dataid10(0, b"\xde\xad\xbe\xef\x00\x11\x22\x33")
+    cmd, cat, _, _ = _last_meta(t)
+    assert cmd == 0x0A00
+    assert cat == 0x03
+
+
+# ── full-channel-state write + preset save/load ──────────────────────────
+def test_full_channel_cmd_low_half() -> None:
+    """Channels 0..3 use cmd=0x10000+ch for full-state writes."""
+    for ch in range(4):
+        assert Device._full_channel_cmd(ch) == 0x10000 | ch
+
+
+def test_full_channel_cmd_high_half() -> None:
+    """Channels 4..7 use cmd=0x04+(ch-4) — the dual-meaning gotcha."""
+    assert Device._full_channel_cmd(4) == 0x04
+    assert Device._full_channel_cmd(5) == 0x05
+    assert Device._full_channel_cmd(6) == 0x06
+    assert Device._full_channel_cmd(7) == 0x07
+
+
+def test_set_full_channel_state_rejects_wrong_size() -> None:
+    d, _ = _make_device()
+    with pytest.raises(ValueError, match="296 bytes"):
+        d.set_full_channel_state(0, b"\x00" * 100)
+
+
+def test_load_preset_by_name_writes_padded_name() -> None:
+    """load_preset_by_name sends just cmd=0x00 cat=0x09 with padded name."""
+    d, t = _make_device()
+    d.load_preset_by_name("Bureau")
+    cmd, cat, _, _ = _last_meta(t)
+    assert cmd == 0x00
+    assert cat == CAT_STATE
+    payload = _last_payload(t)
+    assert payload.startswith(b"Bureau")
+    assert len(payload) == 16  # 15-byte name slot + 1-byte trailing nul
