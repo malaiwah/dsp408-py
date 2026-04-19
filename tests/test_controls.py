@@ -206,6 +206,49 @@ def test_channel_volume_clamps_below_negative_60() -> None:
     assert vol == 0
 
 
+def test_set_channel_polar_writes_byte1() -> None:
+    """Verify polar=True flips byte[1] of the cmd=0x1FNN payload.
+
+    Empirically validated on real hardware: byte[1] = 1 inverts the channel's
+    output by 180° (see tests/loopback/test_phase_invert.py).
+    """
+    d, t = _make_device()
+    d.set_channel(0, db=0.0, muted=False, polar=False)
+    payload_off = _last_payload(t)
+    assert payload_off[1] == 0, f"polar=False should leave byte[1]=0, got {payload_off[1]}"
+
+    d, t = _make_device()
+    d.set_channel(0, db=0.0, muted=False, polar=True)
+    payload_on = _last_payload(t)
+    assert payload_on[1] == 1, f"polar=True should set byte[1]=1, got {payload_on[1]}"
+    # All other bytes match the polar-off payload
+    assert payload_on[0] == payload_off[0]
+    assert payload_on[2:] == payload_off[2:]
+
+
+def test_set_channel_polar_preserves_volume_and_mute() -> None:
+    """set_channel_polar should keep db/muted/delay from the cache."""
+    d, t = _make_device()
+    d.set_channel(2, db=-12.0, muted=True, delay_samples=24)
+    d.set_channel_polar(2, polar=True)
+    p = _last_payload(t)
+    assert p[0] == 0  # still muted
+    assert p[1] == 1  # polar now on
+    assert int.from_bytes(p[2:4], "little") == 480  # vol = -12 dB raw
+    assert int.from_bytes(p[4:6], "little") == 24   # delay
+    assert p[7] == 0x03  # subidx for ch2
+
+
+def test_set_channel_polar_none_preserves_existing() -> None:
+    """polar=None (default) must NOT silently flip polar back to False."""
+    d, t = _make_device()
+    d.set_channel(0, db=0.0, muted=False, polar=True)
+    # Now adjust volume without specifying polar — should stay True
+    d.set_channel_volume(0, db=-6.0)
+    p = _last_payload(t)
+    assert p[1] == 1, "set_channel_volume must not reset polar"
+
+
 def test_channel_subindex_is_correct_per_cmd() -> None:
     """The subidx (payload byte 7) is fixed per channel index."""
     expected = {0: 0x01, 1: 0x02, 2: 0x03, 3: 0x07,

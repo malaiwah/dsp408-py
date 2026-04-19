@@ -698,11 +698,13 @@ class Device:
             )
             return dict(self._channel_cache[channel])
 
-        # Store discovered subidx so set_channel() writes back the correct
-        # DSP type rather than the CHANNEL_SUBIDX table default.
+        # Store discovered subidx + polar so set_channel() writes back the
+        # correct DSP type and preserves the user's phase setting (rather than
+        # silently flipping it back to 0).
         self._channel_cache[channel] = {
             "db": result["db"],
             "muted": result["muted"],
+            "polar": bool(result.get("polar", False)),
             "delay": result["delay"],
             "subidx": result["subidx"],
         }
@@ -786,10 +788,24 @@ class Device:
     @staticmethod
     def _channel_payload(channel: int, db: float, muted: bool,
                          delay_samples: int = 0,
-                         sub_index: int | None = None) -> bytes:
-        """Build the 8-byte per-channel volume/mute write payload.
+                         sub_index: int | None = None,
+                         polar: bool = False) -> bytes:
+        """Build the 8-byte per-channel write payload (cmd=0x1FNN).
+
+        Layout (verified live on hardware, matches blob[246..253] read-back):
+
+        .. code-block:: text
+
+            [0] mute      0=muted, 1=audible (en_bit, INVERTED from leon)
+            [1] polar     0=normal, 1=phase-inverted (180°)  ← was always 0
+            [2..3] gain_le16  raw = (dB×10)+600
+            [4..5] delay_le16 samples
+            [6] eq_mode   reserved/0 in our writes today
+            [7] subidx    DSP channel-type / speaker-role
 
         Args:
+            polar: 180° phase invert. Empirically validated via Scarlett
+                loopback on real hardware (Δphase = ±180° with 6° jitter).
             sub_index: DSP channel-type byte (blob[253]).  Pass the value
                 previously returned by ``get_channel()["subidx"]`` to
                 preserve the firmware's type assignment.  If None, falls
@@ -802,9 +818,10 @@ class Device:
         vol = max(CHANNEL_VOL_MIN, min(CHANNEL_VOL_MAX,
                                        round(db * 10 + CHANNEL_VOL_OFFSET)))
         en_bit = 0 if muted else 1
+        pol_bit = 1 if polar else 0
         si = sub_index if sub_index is not None else CHANNEL_SUBIDX[channel]
         return bytes([
-            en_bit, 0,
+            en_bit, pol_bit,
             vol & 0xFF, (vol >> 8) & 0xFF,
             delay_samples & 0xFF, (delay_samples >> 8) & 0xFF,
             0, si,
@@ -828,6 +845,7 @@ class Device:
                 {
                     "db": 0.0,
                     "muted": False,
+                    "polar": False,
                     "delay": 0,
                     "subidx": CHANNEL_SUBIDX[ch],  # updated by get_channel()
                 }
@@ -835,14 +853,20 @@ class Device:
             ]
 
     def set_channel(self, channel: int, db: float, muted: bool,
-                    delay_samples: int = 0) -> None:
-        """Write per-channel volume + mute + delay in one frame.
+                    delay_samples: int = 0,
+                    polar: bool | None = None) -> None:
+        """Write per-channel volume + mute + delay (+ optional polar) in one frame.
 
         Uses the subidx (DSP channel-type) from the in-memory cache.  If
         ``get_channel()`` has been called before, the cache holds the actual
         device type (possibly non-default); otherwise falls back to
         ``CHANNEL_SUBIDX[channel]``.  Preserving the correct subidx prevents
         accidentally overwriting the firmware's DSP type assignment.
+
+        Args:
+            polar: True/False to set/clear 180° phase invert; None (default)
+                preserves the cached polar value so callers that don't care
+                about polar don't accidentally flip it.
         """
         self._channel_cache_init()
         # Use the discovered subidx (from get_channel readback), falling back
@@ -850,17 +874,27 @@ class Device:
         # for channels whose subidx is 0x00 (uninitialized firmware struct).
         cached_si = self._channel_cache[channel].get("subidx", 0)
         si = cached_si if cached_si != 0 else CHANNEL_SUBIDX[channel]
+        # Default polar to cached value (preserve unless explicitly changed).
+        eff_polar = (self._channel_cache[channel].get("polar", False)
+                     if polar is None else bool(polar))
         payload = self._channel_payload(channel, db, muted, delay_samples,
-                                        sub_index=si)
+                                        sub_index=si, polar=eff_polar)
         cmd = CMD_WRITE_CHANNEL_BASE + channel  # 0x1f00..0x1f07
         self.write_raw(cmd=cmd, data=payload, category=CAT_PARAM)
-        # Update cache (preserve subidx so the next set call also uses it).
+        # Update cache (preserve subidx + new polar for next set call).
         self._channel_cache[channel] = {
             "db": float(db),
             "muted": bool(muted),
+            "polar": eff_polar,
             "delay": int(delay_samples),
             "subidx": si,
         }
+
+    def set_channel_polar(self, channel: int, polar: bool) -> None:
+        """Toggle 180° phase invert on the channel, preserving volume/mute/delay."""
+        self._channel_cache_init()
+        c = self._channel_cache[channel]
+        self.set_channel(channel, c["db"], c["muted"], c["delay"], polar=polar)
 
     def set_channel_volume(self, channel: int, db: float) -> None:
         """Set per-channel volume in dB (-60..0), preserving mute + delay."""
