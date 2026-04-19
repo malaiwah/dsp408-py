@@ -642,3 +642,42 @@ def test_get_channel_updates_cache_with_discovered_subidx() -> None:
     assert payload[7] == non_default_si, (
         f"set_channel must preserve discovered subidx=0x12, got {payload[7]:#04x}"
     )
+
+
+# ── magic-word system-register writes (EXPERIMENTAL, not live-validated) ─
+def test_factory_reset_encodes_magic_word() -> None:
+    """factory_reset() writes 0xA5A6 LE to cmd=0x061F, cat=CAT_STATE."""
+    d, t = _make_device()
+    d.factory_reset()
+    cmd, cat, direction, _seq = _last_meta(t)
+    assert cmd == 0x061F
+    assert cat == CAT_STATE
+    assert direction == DIR_WRITE
+    # Payload is the magic word 0xA5A6 in little-endian (low byte first).
+    assert _last_payload(t) == bytes([0xA6, 0xA5])
+
+
+def test_load_factory_preset_encodes_preset_id() -> None:
+    """load_factory_preset(n) writes 0xB500 | n to the magic register."""
+    d, t = _make_device()
+    d.load_factory_preset(3)
+    assert _last_payload(t) == bytes([0x03, 0xB5])  # 0xB503 LE
+    cmd, cat, _dir, _seq = _last_meta(t)
+    assert cmd == 0x061F
+    assert cat == CAT_STATE
+
+
+def test_load_factory_preset_rejects_out_of_range() -> None:
+    d, _ = _make_device()
+    with pytest.raises(ValueError):
+        d.load_factory_preset(0)
+    with pytest.raises(ValueError):
+        d.load_factory_preset(7)
+
+
+def test_system_register_write_rejects_non_u16() -> None:
+    d, _ = _make_device()
+    with pytest.raises(ValueError):
+        d.system_register_write(-1)
+    with pytest.raises(ValueError):
+        d.system_register_write(0x10000)
