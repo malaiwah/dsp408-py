@@ -1,38 +1,92 @@
 # dsp408-py — Dayton Audio DSP-408 USB control, reverse-engineered
 
 [![CI](https://github.com/malaiwah/dsp408-py/actions/workflows/ci.yml/badge.svg)](https://github.com/malaiwah/dsp408-py/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 A from-scratch, cross-platform (Linux/macOS) implementation of the
 Dayton Audio **DSP-408** USB control protocol, reverse-engineered from
-Windows USBPcap captures of the official `DSP-408.exe` V1.24 GUI.
+USB packet captures of my own DSP-408 hardware.
+
+> **Disclaimer.** This is an independent interoperability project. It is
+> **not** affiliated with, endorsed by, or associated with Dayton Audio
+> in any way. "Dayton Audio" and "DSP-408" are trademarks of their
+> respective owners; mentioned here solely to identify the hardware
+> this driver targets.
+>
+> The reverse-engineering was done for the limited purpose of writing
+> an interoperable driver for hardware I own — protected speech under
+> US DMCA §1201(f) (interoperability exemption) and EU Software
+> Directive 2009/24/EC Article 6. No copyrighted vendor code is
+> redistributed in this repository: the firmware binaries, Windows
+> installer, and Android APK that informed the work are referenced by
+> source URL only. The driver itself is original Python written
+> clean-room; its public API is fact (wire-protocol observations) and
+> its implementation is mine. Provided as-is under MIT, with no
+> warranty and no claim of fitness for any particular purpose.
+>
+> **Use at your own risk.** Talking USB-HID to your DSP-408 with
+> non-vendor software may void warranty support from Dayton. Firmware
+> flashing in particular has bricking potential — the included
+> `dsp408 flash` recovery path was tested on the author's hardware
+> only. If you're not willing to handle a stuck-in-DFU device, use
+> the official Windows app for firmware updates.
 
 Two things this stack does that the Windows app does *not*:
 
 * **Controls multiple DSP-408s at once** — the official app is single-device.
 * **Exposes everything over MQTT with Home Assistant auto-discovery** —
   drop the bridge on a Pi and every DSP-408 plugged into it shows up as
-  a device in HA automatically, with entities for identity, preset
-  name, status, and a `raw` command channel.
+  a device in HA automatically, with native HA entities for every
+  audibly-functional control surface in the firmware.
+
+## What works (firmware v1.06, ``MYDW-AV1.06``)
+
+Each entry below has been **live-validated end-to-end** against real
+audio through a Scarlett 2i2 loopback rig — not just wire round-trip,
+but actual measured dB / phase / time-domain response.
 
 | Subsystem          | Status                                              |
 |--------------------|-----------------------------------------------------|
-| Transport (HID)    | **Working** — `80 80 80 ee` envelope, single + multi-frame reads |
+| Transport (HID)    | **Working** — `80 80 80 ee` envelope, single + multi-frame reads + writes |
 | Connect / identity | **Working** — `dsp408 info` returns `MYDW-AV1.06`   |
-| Preset name read/write | **Working**                                     |
-| Firmware flash     | **Working** — proven on Windows, incl. recovery path |
-| Multi-device       | **Working** — select by index / serial / path       |
-| MQTT + HA discovery| **Working** — one device-based config per DSP-408    |
-| Master volume + mute | **Working** — `cmd=0x0005 cat=0x09`; -60..+6 dB    |
-| Per-channel volume + mute | **Working** — `cmd=0x1f0X cat=0x04`; -60..0 dB |
-| Per-channel delay  | **Working** — sample-accurate, capped at 359 taps    |
-| Per-channel phase invert | **Working** — verified ±180° via Scarlett loopback |
-| Routing matrix 8×4 | **Working** — `cmd=0x21XX cat=0x04`; u8 0..255 levels |
-| Crossover (HPF + LPF) | **Working** — `cmd=0x1200X cat=0x04`; types BW/Bessel/LR, slopes 6..48 dB/oct + bypass |
-| 10-band parametric EQ | **Working** — `cmd=0x10X0Y cat=0x04`; q + gain per band (Q≈256/b4) |
-| Compressor write   | **Skeleton** — cmd `0x230X` decoded but not yet driven through full curve fit |
-| Channel state read (`0x77NN`) | **Working** — full 296-byte blob parsed     |
-| Live VU meters     | **Pending** — both READ candidates (`cmd=0x13`, `cmd=0x03`) static; needs Windows capture with audio playing |
-| Gradio web UI      | Device picker + raw console + firmware flash; typed widgets are placeholders |
+| Multi-device       | **Working** — select by index / serial / path; HA bridge spawns one worker per device |
+| Master volume + mute | **Working** — `cmd=0x0005 cat=0x09`; calibrated -60..+6 dB |
+| Per-output volume + mute | **Working** — `cmd=0x1f0X cat=0x04`; calibrated -60..0 dB |
+| Per-output delay  | **Working** — sample-accurate, capped at 359 taps (8.14 ms @ 44.1 kHz) |
+| Per-output phase invert | **Working** — verified ±180° via Scarlett correlation |
+| Per-output channel name | **Working** — `cmd=0x24XX`; 8-byte ASCII at blob[286..293] |
+| Routing matrix 8×4 | **Working** — `cmd=0x21XX`; u8 0..255 cells, calibrated `20·log10(level/100)` dB curve, +8 dB headroom at 255 |
+| Crossover (HPF + LPF) | **Working** — `cmd=0x1200X`; BW/Bessel/LR + LR-alias, slopes 6..48 dB/oct + bypass at slope=8 |
+| 10-band parametric EQ | **Working** — `cmd=0x10X0Y`; freq + gain + Q (Q ≈ 256/b4 fixed-point reciprocal) |
+| 296-byte full-channel-state write | **Working** — atomic restore via multi-frame WRITE (matches GUI bytes verbatim; one documented 2-byte firmware quirk that the GUI also exhibits) |
+| Save preset to flash | **Working** — `cmd=0x34=01` trigger + bulk per-channel writes |
+| Per-input phase invert | **Working** — only the input MISC field with audio effect (the rest are firmware placeholders, see below) |
+| Firmware flash     | **Working** — proven on Windows + recovery path; **bricking risk — see disclaimer** |
+| MQTT + HA discovery| **Working** — one device-based config per DSP-408; per-poll state refresh |
+| Gradio web UI      | Master / channel name / per-input polar / **live mixer matrix** wired; per-channel EQ + crossover sliders are layout placeholders (use the typed library API or `raw` MQTT topic for those) |
+
+## What's NOT in firmware v1.06
+
+Hardware features that **exist on the wire / in the data model but
+the firmware doesn't actually implement**. Each was confirmed inert
+by 3-to-4 independent lines of evidence (loopback rig measurements,
+firmware disassembly, Android app source, Windows GUI inspection):
+
+| Feature                | Status              | Evidence  |
+|------------------------|---------------------|-----------|
+| **Compressor / limiter**   | **DEAD** in v1.06   | Audio rig + firmware disasm + leon Android source + Windows GUI all confirm the block isn't wired to audio. The wire encoding decodes correctly (`cmd=0x230X`, lands at blob[278..285]) and round-trips through reads, but no parameter — threshold, attack, release, all_pass_q, linkgroup — produces audible compression at any setting. The Windows GUI doesn't expose compressor controls anywhere. |
+| **VU / live audio meters** | **DEAD** in v1.06   | Both READ candidates (`cmd=0x13` and `cmd=0x03` idle-poll) return completely static bytes across full input-level / mute / route sweeps. Firmware disasm finds no audio-level computation path. leon Android source has no decoder for any meter frame. Windows GUI has no level visualization. |
+| **Per-input mute / volume / delay / EQ / noisegate** | **DEAD** in v1.06 | Wire writes round-trip exactly through `read_input_state` (288-byte blob at `cat=0x03`), but only **input phase invert** affects audio. Mute, volume (full u8 sweep), delay, 15-band EQ, and noisegate all measured 0 dB / 0 sample / 0 dB-peak change. |
+| **Speaker-template tonal shaping** | Misnamed | `apply_speaker_template()` writes the spk_type byte (blob[253]). It does NOT apply a speaker-specific HPF/LPF/EQ — different templates produce identical frequency response. What it actually does is reassign the channel to a different DSP slot which may have ~+18 dB of internal pre-gain. Treat as "DSP slot picker", not "speaker preset". |
+
+The corresponding Python APIs (`set_compressor`, `set_input`,
+`apply_speaker_template`, etc.) are **kept** so that:
+1. Wire encoding stays documented and exposed for forward-compat with
+   any future firmware revision that activates these blocks.
+2. Bytes round-trip exactly, so they're safe for state-preservation
+   workflows (read → modify → write).
+3. Each carries a clear "INERT" / "DEAD" docstring so callers aren't
+   misled.
 
 ## Install
 
@@ -291,30 +345,42 @@ multi-device enumeration logic (11), MQTT discovery shape + paho
 v1/v2 compatibility (9), and device-alias loading / lookup (13).
 No real USB or broker required.
 
-## Reverse-engineering history
+## Reverse-engineering write-ups
 
-All USB captures, decoded traces, firmware-patch experiments, macOS
-IOKit diagnostic binaries, early interface prototypes, and the
-DriverKit stub are preserved on the
-[`reverse-engineering`](../../tree/reverse-engineering) branch. Check
-it out if you want to see how the protocol was decoded:
+Decoded protocol findings, blob-layout maps, and per-feature audio-
+validation results live on the
+[`reverse-engineering`](../../tree/reverse-engineering) branch under
+`notes/`. Includes per-output 296-byte channel state breakdown,
+Android v1.23 source-mining results, captures from the official
+Windows GUI, and the negative-result evidence that pinned down which
+firmware blocks are truly inert.
 
 ```bash
 git fetch origin reverse-engineering
 git checkout reverse-engineering
 ```
 
-## Hardware facts (from the manual, for reference)
+The branch references — but does **not** include — the Dayton firmware
+binaries, Windows installer, and Android APK that informed the work.
+Source URLs for those are listed in `notes/SOURCES.md` so anyone
+extending the work can fetch them directly from Dayton / the Play
+Store and reproduce the analysis on their own copy.
 
-4 RCA + 4 high-level inputs, 8 RCA outputs, 10-band PEQ per output (all
-peaking — the manual's mention of LS/HS shelves on bands 1 & 10 is not
-present in the wire format), HPF + LPF per output (Linkwitz-Riley /
-Bessel / Butterworth — firmware also accepts a 4th filter-type byte
-that aliases LR; slopes 6/12/18/24 dB/oct per the manual but firmware
-accepts 6..48 + bypass; 20 Hz – 20 kHz), per-channel delay up to
-8.1471 ms (277 cm) @ 44.1 kHz / 7.48 ms @ 48 kHz, 6 presets, master
-volume, 4×8 input→output mixer (cells take u8 0..255 levels — the GUI
-exposes only on/off but the firmware accepts the full range).
+## Hardware facts (live-verified, 2026-04-19)
 
-Note: the DSP-408 is **HID-only** — it does NOT enumerate as a USB
-Audio Class device. Audio I/O happens entirely on the analog jacks.
+4 RCA + 4 high-level inputs, 8 RCA outputs, 10-band parametric EQ per
+output (all peaking — the manual's mention of LS/HS shelves on bands
+1 & 10 is not present in the wire format and was not exposed in
+firmware), HPF + LPF per output (Butterworth / Bessel / Linkwitz-Riley
++ a 4th filter-type byte that aliases LR; slopes 6/12/18/24 dB/oct
+per the manual but firmware accepts the full 6..48 + bypass; 20 Hz –
+20 kHz), per-output delay up to 8.1471 ms (277 cm) @ 44.1 kHz / 7.48
+ms @ 48 kHz, 6 named preset slots in flash, master volume, 4×8
+input→output mixer (cells take u8 0..255 levels — the GUI exposes
+non-binary cells behind a click-through; firmware accepts the full
+range with a clean `20·log10(level/100)` dB curve and ~+8 dB headroom
+above unity).
+
+The DSP-408 is **HID-only** — it does NOT enumerate as a USB Audio
+Class device. Audio I/O happens entirely on the analog jacks; the
+USB interface only carries control HID frames.
