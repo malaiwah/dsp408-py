@@ -433,20 +433,12 @@ local function decode_full_channel_state_blob(tvb, tree, cmd)
       band, freq, gdb, gain, bw, q))
   end
 
-  -- ── Post-48 region offsets: firmware-correct, +2 from protocol.py ───
-  -- The protocol.py constants (OFF_MUTE=246, OFF_HPF_FREQ=254, etc.) were
-  -- calibrated against Python's read_response() output, which has a -2
-  -- shift from byte 48 onwards due to a parse_frame() truncation bug
-  -- (reads 48 bytes of multi-frame first when it should read 50 — no
-  -- chk/end on a multi-frame first). The two bugs cancel in Python land.
-  -- Our Lua reassembly uses the correct 50-byte first frame, so we read
-  -- firmware-truth bytes; all offsets in THIS block are shifted +2 from
-  -- protocol.py. Verified against reset_to_defaults.pcapng — every
-  -- channel shows audible / 0 dB / 0 delay and spk_type matching
-  -- CHANNEL_SUBIDX[ch] exactly, all factory defaults.
-  -- Will converge with protocol.py once the parse_frame bug is fixed.
+  -- Offsets mirror dsp408/protocol.py's OFF_* constants post-cd84295
+  -- (parse_frame fix). Before that fix, protocol.py and this file
+  -- diverged by 2 bytes for every offset ≥48 — see the commit for the
+  -- full history if you're looking at old captures.
 
-  -- Basic record at 248..255 (firmware-correct, +2 from protocol.py 246..253)
+  -- Basic record at 248..255 (OFF_MUTE..OFF_SPK_TYPE)
   local mute   = tvb(248,1):uint() == 0   -- INVERTED: 1=audible, 0=muted
   local polar  = tvb(249,1):uint()
   local vol    = tvb(250,2):le_uint()
@@ -461,7 +453,7 @@ local function decode_full_channel_state_blob(tvb, tree, cmd)
   basic:add(tvb(254,1), string.format("byte_254: 0x%02X (semantics unknown)", tvb(254,1):uint()))
   basic:add(tvb(255,1), string.format("spk_type: %d (%s)", spktyp, SPK_TYPE_NAMES[spktyp] or "?"))
 
-  -- Crossover 256..263 (firmware-correct)
+  -- Crossover 256..263 (OFF_HPF_FREQ..OFF_LPF_SLOPE)
   local hpf_f = tvb(256,2):le_uint()
   local hpf_t = tvb(258,1):uint()
   local hpf_s = tvb(259,1):uint()
@@ -476,7 +468,7 @@ local function decode_full_channel_state_blob(tvb, tree, cmd)
   xtree:add(tvb(262,1), string.format("LPF type: %s", FILTER_TYPE_NAMES[lpf_t] or "?"))
   xtree:add(tvb(263,1), string.format("LPF slope: %s", SLOPE_NAMES[lpf_s] or "?"))
 
-  -- Mixer 264..271 (IN1..IN8 levels, firmware-correct)
+  -- Mixer 264..271 (OFF_MIXER, IN1..IN8 levels)
   local mxtree = tree:add(tvb(264, 8), "Mixer (264..271)")
   local mx = {}
   for i = 0, 7 do
@@ -485,9 +477,9 @@ local function decode_full_channel_state_blob(tvb, tree, cmd)
     if v ~= 0 then mx[#mx+1] = string.format("IN%d=0x%02X", i+1, v) end
   end
 
-  -- 272..279: compressor shadow (read-only mirror, never changes) — skip detailed decode
+  -- 272..279 OFF_COMP_SHADOW: read-only mirror, never changes — skip detailed decode
 
-  -- Compressor at 280..287 (firmware-correct)
+  -- Compressor at 280..287 (OFF_ALL_PASS_Q..OFF_LINKGROUP)
   local cq      = tvb(280,2):le_uint()
   local cattack = tvb(282,2):le_uint()
   local crel    = tvb(284,2):le_uint()
@@ -500,7 +492,7 @@ local function decode_full_channel_state_blob(tvb, tree, cmd)
   ctree:add(tvb(286,1), string.format("threshold: %d", cthresh))
   ctree:add(tvb(287,1), string.format("linkgroup: %d", clink))
 
-  -- Name at 288..295 (firmware-correct)
+  -- Name at 288..295 (OFF_NAME, 8 bytes ASCII zero-padded)
   local name = tvb:raw(288, 8):gsub("[%z%s]+$", "")
   tree:add(f.n_name, tvb(288, 8), name)
 

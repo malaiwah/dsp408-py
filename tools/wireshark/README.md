@@ -220,11 +220,11 @@ Output schema (one record per blob):
 }
 ```
 
-> ⚠️ The compressor and name fields mirror `dsp408/protocol.py` offsets
-> verbatim. A recent investigation (see the `Investigate compressor/name
-> blob offsets +2 shift` task) suggests those offsets may be shifted +2
-> from reality. `blob_hex` is always the raw bytes — trust that if the
-> decoded fields look off.
+All offsets mirror `dsp408/protocol.py`'s `OFF_*` constants. They were
+misaligned before commit `cd84295` (parse_frame multi-frame under-read
+fix); the Python library and this decoder have since been re-aligned
+to firmware-truth offsets. `blob_hex` is always the raw bytes —
+compare against that if a decode ever looks suspicious.
 
 ## Useful display filters
 
