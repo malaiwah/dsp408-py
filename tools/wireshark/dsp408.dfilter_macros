@@ -1,0 +1,18 @@
+# DSP-408 display filter macros — import via Wireshark:
+#   Edit → Preferences → Advanced, or copy this file to
+#     ~/.config/wireshark/dfilter_macros  (Linux/macOS)
+#     %APPDATA%\Wireshark\dfilter_macros  (Windows)
+# Then use in the filter bar as: ${dsp408_notrivial} or ${macro_name}
+#
+# Format: "macroname" "filter expression"   (one per line, both quoted)
+
+"dsp408_notrivial"	"dsp408 and not (dsp408.cmd_name == \"idle_poll\" or dsp408.cmd_name == \"status\" or dsp408.cmd_name matches \"global_0x0\\\\d\")"
+"dsp408_writes"	"dsp408 and dsp408.direction == 0xa1"
+"dsp408_reads"	"dsp408 and dsp408.direction == 0xa2"
+"dsp408_replies"	"dsp408 and (dsp408.direction == 0x51 or dsp408.direction == 0x53)"
+"dsp408_multi_start"	"dsp408.payload_len > 48"
+"dsp408_multi_done"	"dsp408.reassembled_len > 0"
+"dsp408_persist"	"dsp408.cmd_name contains \"preset_save_trigger\" or dsp408.cmd_name contains \"factory_reset\""
+"dsp408_unknown"	"_ws.expert.message contains \"Unnamed cmd\""
+"dsp408_slow"	"dsp408.rtt_ms > 100"
+"dsp408_errors"	"_ws.expert.severity == \"Error\" and dsp408"

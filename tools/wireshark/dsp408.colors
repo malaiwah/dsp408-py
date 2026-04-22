@@ -1,3 +1,6 @@
+@DSP-408 idle noise (de-emphasize)@dsp408.cmd_name == "idle_poll" or dsp408.cmd_name == "status"@[55000,55000,55000][37000,37000,37000]
+@DSP-408 unknown cmd (RE target)@_ws.expert.message contains "Unnamed cmd"@[65535,58000,20000][0,0,0]
+@DSP-408 slow RTT >100ms@dsp408.rtt_ms > 100@[65535,50000,50000][0,0,0]
 @Bad DSP-408 magic@dsp408 and dsp408.magic != 0x808080ee@[65535,40000,40000][0,0,0]
 @Bad DSP-408 checksum@dsp408.checksum_ok == 0@[65535,40000,40000][0,0,0]
 @DSP-408 abandoned multi-frame@_ws.expert.message contains "Abandoned"@[65535,55000,40000][0,0,0]

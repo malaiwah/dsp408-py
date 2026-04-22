@@ -138,6 +138,13 @@ f.fr_magic    = ProtoField.string("dsp408.factory_reset.magic", "Factory-reset m
 -- preset save
 f.ps_byte     = ProtoField.uint8 ("dsp408.preset_save.byte",   "Preset-save trigger byte", base.HEX)
 
+-- Continuation-frame fields continued: request/reply pairing
+f.response_in = ProtoField.framenum("dsp408.response_in", "Reply in frame",
+                                    base.NONE, frametype.RESPONSE)
+f.request_in  = ProtoField.framenum("dsp408.request_in",  "Request in frame",
+                                    base.NONE, frametype.REQUEST)
+f.rtt_ms      = ProtoField.float   ("dsp408.rtt_ms",      "Round-trip time (ms)")
+
 -- Expert info
 local ef_bad_magic    = ProtoExpert.new("dsp408.bad_magic",    "Bad magic",
                                         expert.group.MALFORMED, expert.severity.ERROR)
@@ -151,8 +158,12 @@ local ef_abandoned    = ProtoExpert.new("dsp408.abandoned",    "Abandoned multi-
                                         expert.group.MALFORMED, expert.severity.WARN)
 local ef_reassembled  = ProtoExpert.new("dsp408.reassembled",  "Multi-frame reassembled here",
                                         expert.group.COMMENTS_GROUP, expert.severity.NOTE)
+local ef_unknown_cmd  = ProtoExpert.new("dsp408.unknown_cmd",  "Unnamed cmd — RE target",
+                                        expert.group.UNDECODED, expert.severity.WARN)
+local ef_orphan_reply = ProtoExpert.new("dsp408.orphan_reply", "Reply with no matching request in capture",
+                                        expert.group.SEQUENCE, expert.severity.NOTE)
 dsp408.experts = { ef_bad_magic, ef_bad_checksum, ef_bad_end, ef_multiframe,
-                   ef_abandoned, ef_reassembled }
+                   ef_abandoned, ef_reassembled, ef_unknown_cmd, ef_orphan_reply }
 
 -- ── Command name resolution ────────────────────────────────────────────
 local function resolve_cmd(cmd, direction, category, payload_len)
@@ -502,8 +513,23 @@ local DECODERS = {
 --   per_frame[fnum]    — per-packet memo for re-dissection (Wireshark
 --                        visits packets multiple times when filtering).
 
-local pending   = {}  -- conv_key → pending entry
-local per_frame = {}  -- frame_number → frame info
+local pending     = {}  -- conv_key → pending multi-frame entry
+local per_frame   = {}  -- frame_number → frame info
+-- Request-reply pairing: pair (cmd, category) — seq is unreliable (device
+-- often mirrors seq=0 even when the host incremented it; see device.py
+-- _exchange "lenient seq match" comment). Table entries are ephemeral:
+-- created when a WRITE/READ request is seen, cleared when the matching
+-- ack/reply arrives. Per-frame pairing results live in `paired`.
+local pending_req = {}  -- "cmd:cat" → { frame, ts }
+local paired      = {}  -- frame_number → { peer_frame, rtt_ms, role }
+
+local function req_key(cmd, category)
+  return string.format("%d:%d", cmd, category)
+end
+
+-- Which direction is a "request" vs "reply"?
+local REQ_DIRS = { [0xA1] = true, [0xA2] = true }
+local REPLY_OF = { [0xA1] = 0x51, [0xA2] = 0x53 }
 
 -- Field extractor for USB endpoint (populated by the built-in USB dissector)
 local f_usb_endpoint = Field.new("usb.endpoint_address")
@@ -564,7 +590,47 @@ local function dissect_first_or_single(buffer, pinfo, tree)
   subtree:add_le(f.payload_len, buffer(12, 2))
 
   local name, dec_key = resolve_cmd(cmd, direction, category, payload_len)
-  subtree:add(f.cmd_name, name)
+  local cmd_item = subtree:add(f.cmd_name, name)
+  -- Unknown-cmd highlighter: unmapped cmds fall through to "cmd_0xNNNN" —
+  -- flag as RE target so they pop in the packet list.
+  if name:find("^cmd_0x") then
+    cmd_item:add_tvb_expert_info(ef_unknown_cmd, buffer(8, 4),
+      string.format("Unnamed cmd 0x%X cat=0x%02X dir=0x%02X — add to resolve_cmd()",
+                    cmd, category, direction))
+  end
+
+  -- Request-reply pairing (first pass only, state lives across frames)
+  if not pinfo.visited then
+    local k = req_key(cmd, category)
+    if REQ_DIRS[direction] then
+      -- Stash this request so the matching reply can link back
+      pending_req[k] = { frame = pinfo.number, ts = pinfo.abs_ts, dir = direction }
+    elseif direction == 0x51 or direction == 0x53 then
+      local req = pending_req[k]
+      -- Only pair if directions are a valid (request,reply) pair
+      if req and REPLY_OF[req.dir] == direction then
+        local rtt_ms = (pinfo.abs_ts - req.ts) * 1000.0
+        paired[req.frame]    = { peer = pinfo.number, rtt = rtt_ms, role = "request" }
+        paired[pinfo.number] = { peer = req.frame,    rtt = rtt_ms, role = "reply"   }
+        pending_req[k] = nil
+      end
+    end
+  end
+
+  -- Surface pairing info in the tree (every pass)
+  local pair = paired[pinfo.number]
+  if pair then
+    if pair.role == "request" then
+      subtree:add(f.response_in, pair.peer):set_generated()
+    else
+      subtree:add(f.request_in,  pair.peer):set_generated()
+    end
+    subtree:add(f.rtt_ms, pair.rtt):set_generated():append_text(" ms")
+  elseif direction == 0x51 or direction == 0x53 then
+    -- Reply without matching request — orphan (often happens when capture
+    -- starts mid-conversation or after a drop)
+    subtree:add_tvb_expert_info(ef_orphan_reply, buffer(4, 1))
+  end
 
   local is_multi = payload_len > MAX_PAYLOAD_SINGLE
   subtree:add(f.multiframe, is_multi):set_generated()
@@ -731,6 +797,15 @@ local function dissect_continuation(buffer, pinfo, tree)
     subtree:add(f.cont_of,     info.first_frame):set_generated()
     subtree:add(f.cont_index,  info.index):set_generated()
     subtree:add(f.cont_total,  info.total):set_generated()
+    -- Surface cmd + cmd_name on continuations (including the last) so
+    -- tshark -T fields consumers (e.g. dsp408_blob_export.py) can grab
+    -- the command context without joining to the first frame.
+    if info.cmd then
+      subtree:add(f.cmd,      info.cmd):set_generated()
+    end
+    if info.name then
+      subtree:add(f.cmd_name, info.name):set_generated()
+    end
 
     local dir_hint = ""  -- we don't know direction from bytes alone
     local label = string.format("continuation %d/%d of frame %d (%s)",
@@ -846,6 +921,8 @@ dsp408:register_heuristic("usb.bulk",      dsp408_heuristic)
 
 -- ── Init: clear state when a new capture is loaded ───────────────────
 function dsp408.init()
-  pending   = {}
-  per_frame = {}
+  pending     = {}
+  per_frame   = {}
+  pending_req = {}
+  paired      = {}
 end

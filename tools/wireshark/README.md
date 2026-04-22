@@ -59,6 +59,173 @@ WR     seq=0  full_channel_state(ch=1)      ch=1 (296-byte blob — see first-fr
 
 After editing `dsp408.lua`, reload via **Tools → Lua → Reload Lua Plugins**.
 
+## Live captures (platform recipes)
+
+DSP-408 traffic is USB-class HID; you need a USB-level capture, not a
+network one.
+
+### Linux (usbmon)
+
+```sh
+sudo modprobe usbmon
+# Find the bus the DSP-408 is plugged into:
+lsusb -d 0483:5750 -t    # shows "Bus 00N Device..."
+# Capture that bus (replace N):
+sudo wireshark -i usbmonN
+# Or CLI-only:
+sudo tshark -i usbmonN -X lua_script:tools/wireshark/dsp408.lua -l
+```
+
+The `-l` flag flushes each packet so you see decoded frames live.
+
+### macOS
+
+macOS ships USB capture support in Wireshark, but you need the BPF
+helper. Run the one-time installer from the Wireshark DMG
+(`Install ChmodBPF.pkg`) then:
+
+```sh
+# List USB interfaces — look for XHC20 / XHC1 (varies by Mac):
+tshark -D | grep -i usb
+# Capture live with the dissector loaded:
+tshark -i XHC20 -X lua_script:$(pwd)/tools/wireshark/dsp408.lua -l
+```
+
+Gotcha: macOS sometimes misses the first 1–2 packets immediately after
+plug-in. If your capture starts at the `connect` cmd (0xCC) rather than
+USB enumeration, that's this — start Wireshark before the GUI opens.
+
+### Windows
+
+Install USBPcap (bundled with Wireshark installer, enable the checkbox).
+Then:
+
+```
+Wireshark → Capture → USBPcapN  (pick the bus the DSP-408 is on)
+```
+
+USBPcap shows VID/PID per URB so the `usb.product` registration triggers
+cleanly. The heuristic on `usb.interrupt` is the fallback for Linux's
+usbmon captures where VID/PID aren't replicated on every URB.
+
+### Offline analysis with the dissector
+
+No restart needed — pass `-X` to tshark or put `dsp408.lua` in your
+personal plugins dir so every Wireshark launch loads it:
+
+```sh
+tshark -X lua_script:tools/wireshark/dsp408.lua -r capture.pcapng \
+       -Y '${dsp408_notrivial}'     # uses a display-filter macro (see next)
+```
+
+## Display-filter macros
+
+`dsp408.dfilter_macros` ships a set of named filters to paste into the
+filter bar. Install by copying to your Wireshark personal config:
+
+```sh
+cp tools/wireshark/dsp408.dfilter_macros ~/.config/wireshark/dfilter_macros
+```
+
+(Windows: `%APPDATA%\Wireshark\dfilter_macros`.) Then use
+`${macroname}` in the filter bar:
+
+| Macro | Hides | Shows |
+|---|---|---|
+| `${dsp408_notrivial}` | idle_poll, status, global_0x0* | every "real" cmd |
+| `${dsp408_writes}` | everything except WRITE (dir=0xA1) | host→dev writes |
+| `${dsp408_reads}` | everything except READ requests | host→dev reads |
+| `${dsp408_replies}` | everything except replies/ACKs | dev→host |
+| `${dsp408_multi_start}` | | first frame of every multi-frame payload |
+| `${dsp408_multi_done}` | | the last continuation, where reassembly finishes |
+| `${dsp408_persist}` | | `preset_save_trigger` + `factory_reset` magic |
+| `${dsp408_unknown}` | | cmds we haven't named yet — **RE targets** |
+| `${dsp408_slow}` | | round-trip > 100 ms (likely flash writes or multi-frame) |
+| `${dsp408_errors}` | | any expert-info ERROR (bad magic / bad checksum) |
+
+The `idle_poll` suppression is the single biggest UX win — a busy
+capture drops from ~40k rows to a few hundred visible events.
+
+## Request-reply pairing + RTT
+
+Every WRITE (dir=0xA1) and READ request (dir=0xA2) is matched with its
+corresponding ACK / reply by `(cmd, category)` (seq is unreliable — the
+device mirrors seq=0 for writes regardless). The pairing exposes three
+synthetic fields:
+
+* `dsp408.response_in` — frame # of the reply (shown on the request row)
+* `dsp408.request_in` — frame # of the request (shown on the reply row)
+* `dsp408.rtt_ms` — round-trip time in milliseconds
+
+Jump between paired frames by double-clicking the frame-number link in
+the tree, or filter with `dsp408.rtt_ms > 100` to find slow ops. Typical
+latencies: idle_poll/get_info ~1.5 ms, simple write ~25 ms, multi-frame
+write (296-byte blob) ~250–750 ms (includes flash commit if preceded
+by `preset_save_trigger`).
+
+Orphan replies — replies without a matching request in the capture
+(capture started mid-conversation, or URB dropped) — get a NOTE-level
+expert info so they stand out.
+
+## Unknown-cmd highlighter
+
+Cmds not mapped by `resolve_cmd()` are labeled `cmd_0xNNNN` and flagged
+as WARN-severity expert info **"Unnamed cmd — RE target"**. Combined
+with the coloring rules, they light up orange in the packet list and
+yellow in the Info column. Filter with `${dsp408_unknown}` to list all
+RE targets in a capture.
+
+This is the fast path for "I saw the Windows app do something new, what
+cmd did it emit?" — it pops in the packet list before you even know
+what to look for.
+
+## Reassembled blob → annotated JSON
+
+`dsp408_blob_export.py` runs tshark with the dissector and decodes every
+reassembled 296-byte channel-state blob in the capture into structured
+JSON Lines (one record per blob):
+
+```sh
+# Dump everything to stdout (jsonl, one line per blob):
+tools/wireshark/dsp408_blob_export.py captures/full-sequence.pcapng
+
+# Pretty-print one blob:
+tools/wireshark/dsp408_blob_export.py cap.pcapng | head -1 | jq .
+
+# Compare two captures of the "same" configuration:
+diff <(tools/wireshark/dsp408_blob_export.py before.pcapng) \
+     <(tools/wireshark/dsp408_blob_export.py after.pcapng)
+
+# Pivot on channel 2 EQ band 5:
+tools/wireshark/dsp408_blob_export.py cap.pcapng | \
+  jq -c 'select(.channel == 2) | {frame, band5: .eq_bands[5]}'
+```
+
+Output schema (one record per blob):
+
+```json
+{
+  "frame": 77, "timestamp": 1776632324.48, "channel": 0,
+  "cmd": "0x7700", "cmd_name": "read_channel_state(ch=0)",
+  "continuation_of_frame": 69, "blob_hex": "1f005802...",
+  "eq_bands": [{"freq_hz":31,"gain_db":0.0,"bw_byte":52,"q":4.923}, ...],
+  "basic": {"mute":true,"polar_inverted":false,"vol_db":-59.9,
+            "delay_samples":600,"byte_252":0,"spk_type":0,"spk_type_name":"none"},
+  "crossover": {"hpf":{"freq_hz":20,"filter":"Butterworth","slope":"12 dB/oct"},
+                "lpf":{"freq_hz":20000, ...}},
+  "mixer": [0,1,0,0,0,0,0,0],
+  "compressor": {"all_pass_q":420,"attack_ms":56,"release_ms":500,
+                 "threshold":0,"linkgroup":0},
+  "name": "       "
+}
+```
+
+> ⚠️ The compressor and name fields mirror `dsp408/protocol.py` offsets
+> verbatim. A recent investigation (see the `Investigate compressor/name
+> blob offsets +2 shift` task) suggests those offsets may be shifted +2
+> from reality. `blob_hex` is always the raw bytes — trust that if the
+> decoded fields look off.
+
 ## Useful display filters
 
 ```
