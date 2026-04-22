@@ -292,23 +292,6 @@ def _resolve_selector(
     raise TypeError(f"selector must be int|str|None, got {type(selector)}")
 
 
-def _payload_matches_ignoring_counter(a: bytes, b: bytes) -> bool:
-    """Byte-equal comparison that ignores the per-read counter byte
-    at offset 294 of a 296-byte channel-state blob.
-
-    The firmware increments byte[294] on every read (verified by doing
-    consecutive reads with no writes in between; only byte[294] ever
-    differs).  Used by :meth:`Device.read_channel_state` to decide when
-    two consecutive reads have converged.
-    """
-    if len(a) != len(b):
-        return False
-    # Fast path for the common 296-byte case
-    if len(a) == 296:
-        return a[:294] == b[:294] and a[295:] == b[295:]
-    return a == b
-
-
 class Device:
     """High-level DSP-408 USB control.
 
@@ -529,53 +512,32 @@ class Device:
         """Open the command session.  Returns the 1-byte status code the
         device replies with (``0x00`` = ok).
 
-        If ``warmup`` is true (default), also does a warmup pass over
-        every output channel to get past the firmware's early-session
-        read-divergence window (see :meth:`read_channel_state` for the
-        full characterisation).  The warmup pass issues 3 per-channel
-        reads × 8 channels = 24 single-frame reads, taking ~500 ms on
-        a Pi.  After warmup the channel-state reads return byte-exact
-        stable blobs.
+        If ``warmup`` is true (default), reads every output channel
+        once after the connect to settle the firmware's internal state
+        before callers start writing.  The firmware has a known
+        startup-write-drop quirk (see :meth:`set_channel` docstring):
+        the first ~5–6 cmd=0x1FNN writes after a fresh session are
+        silently dropped if they arrive back-to-back with no reads or
+        sleeps in between.  An 8-channel read pass drains that quota
+        cheaply (~200 ms).
 
-        Set ``warmup=False`` if you never call :meth:`read_channel_state`
-        (e.g. write-only MQTT bridges using only the event-driven
-        control surface).
+        Set ``warmup=False`` for minimal-latency connects where you'll
+        either do your own pacing or don't care about the first few
+        writes landing.
         """
         reply = self.read_raw(cmd=CMD_CONNECT, category=CAT_STATE)
         if not reply.payload:
             raise ProtocolError("CONNECT: empty payload")
         if warmup:
-            self._warmup_channel_reads()
-        return reply.payload[0]
-
-    def _warmup_channel_reads(self, rounds: int = 2) -> None:
-        """Read every output channel ``rounds`` times adaptively to push
-        past the firmware's cold-read window.
-
-        Empirical characterisation (2026-04-22, device ``4EAA4B964C00``
-        firmware v1.06):
-
-            100 consecutive reads of ch3 in a fresh session: 6/100
-            returned a 2-byte-left-shifted variant; all 6 divergent
-            reads were among the first 6 of the session.  Reads 6..99
-            were byte-exact stable.
-
-        Each adaptive ``read_channel_state()`` call (``double_read=True``,
-        the default) reads until two consecutive replies match — so a
-        single warmup round already eats the cold zone for most
-        channels.  Two rounds is belt-and-braces: if a channel was still
-        cold on round 1, round 2 reliably catches it.  Total cost:
-        ~500–1000 ms on a Pi (adaptive reads converge in 2–5 attempts).
-        """
-        for _ in range(rounds):
             for ch in range(8):
                 try:
-                    self.read_channel_state(ch)
+                    self.read_channel_state(ch, retry_on_divergence=False)
                 except ProtocolError:
-                    # A cold read can occasionally return a corrupt
-                    # frame that our parser rejects; we don't care,
-                    # the warmup's job is to push past this.
+                    # A dropped / malformed cold read shouldn't block
+                    # the connect — the warmup's job is just to drain
+                    # the firmware's startup queue.
                     pass
+        return reply.payload[0]
 
     def get_info(self) -> str:
         """Return the device identity string, e.g. `"MYDW-AV1.06"`."""
@@ -626,122 +588,110 @@ class Device:
         self,
         channel: int,
         *,
-        double_read: bool = True,
-        max_attempts: int = 6,
+        retry_on_divergence: bool = True,
+        max_attempts: int = 4,
     ) -> bytes:
         """Read the full state of output channel N (0..7) — 296 bytes.
 
-        Layout is partially decoded.  Known prefix from one capture:
-            28 01 1f 00 | 58 02 34 00 00 00 | 41 00 ...
-        where bytes[4:6] as LE16 = 600 (volume at 0 dB), bytes[6:8] as
-        LE16 = 52 (delay in samples).
+        Layout is fully decoded; see :meth:`parse_channel_state_blob`
+        for the field table.  The blob mirrors the firmware's internal
+        per-channel struct, so every high-level setter
+        (:meth:`set_channel`, :meth:`set_routing`, :meth:`set_crossover`,
+        :meth:`set_eq_band`, :meth:`set_compressor`,
+        :meth:`set_channel_name`) lands in a defined subregion of this
+        blob and is directly observable by reading it back.
 
-        The blob also embeds the 8-byte write-format channel record at
-        offset ~246:
-            [en, 00, vol_lo, vol_hi, delay_lo, delay_hi, 00, subidx]
-        Use `parse_channel_state_blob()` to extract that record.
+        **Residual firmware quirk**: even with the 2026-04-22
+        :func:`dsp408.protocol.parse_frame` fix (which resolved the
+        bulk of the previously-reported "read-divergence" behavior),
+        the firmware still occasionally emits a 2-byte-left-shifted
+        variant of the EQ region (offsets 48..79, bands 6..9 +
+        padding).  The semantic per-channel record (offsets 248..295
+        — mute, gain, delay, crossover, routing, compressor, name)
+        is never affected.
 
-        **Firmware read-divergence quirk** (v1.06 ``MYDW-AV1.06``,
-        characterised 2026-04-22 — see
-        ``tests/live/test_read_stability.py``): on a fresh session the
-        first few reads of each channel occasionally return a blob with
-        a 2-byte left-shift in the upper bytes (offsets ≈ 48..245,
-        bands 6..9 + padding region).  Measured rate: 6 % of the first
-        100 reads of ch3, all within the first 6 reads; 0 % thereafter.
-        The intended per-channel record (mute / gain / delay / crossover
-        / routing / compressor / name at offsets 244..293) was NOT
-        affected in any observed trial, but byte-exact diffs of the EQ
-        region (used by surgical-write tests and in ``save_preset``)
-        were corrupted by this.
-
-        To guarantee a byte-exact read, this method defaults to an
-        **adaptive read-until-stable** strategy: it reads up to
-        ``max_attempts`` times, returning the first blob that matches
-        the previous blob (ignoring byte 294, a per-read counter).  If
-        the firmware never stabilises within the attempt budget, the
-        last read is returned.  In practice this converges in 2–3
-        attempts (cold reads may need 4–5).  Cost is 1–5× transport
-        latency — a full 296-byte read takes ~20 ms on a Pi.
-
-        Call with ``double_read=False`` (and optionally ``max_attempts``
-        reduced) if you need single-shot latency and are happy to accept
-        the occasional shifted blob (e.g. MQTT live-status polls).
+        To protect callers that do byte-exact diffs of the whole
+        blob, the default read path reads up to ``max_attempts``
+        times and returns the first blob that agrees with its
+        predecessor.  In practice this converges in 2 attempts
+        (~40 ms total); worst case is ``max_attempts`` × single-read
+        latency.  Pass ``retry_on_divergence=False`` to skip the
+        retry (e.g. for latency-sensitive MQTT polling of the
+        semantic region only).
         """
         if not 0 <= channel <= 7:
             raise ValueError(f"channel must be in 0..7, got {channel}")
         # CMD_READ_CHANNEL_BASE is 0x0077; reads in capture are 0x7700..0x7707.
         # Channel index goes in the high byte: 0x77NN → ((0x77 << 8) | NN).
-        # (Historically this method built `0x77 | (NN<<8)` which silently
-        # produced wrong cmds for channel > 0 — fixed below.)
         cmd = (CMD_READ_CHANNEL_BASE << 8) | channel    # 0x7700, 0x7701, …
-        if not double_read:
+        if not retry_on_divergence:
             reply = self.read_raw(cmd=cmd, category=CAT_PARAM, timeout_ms=3000)
             return reply.payload
-        # Adaptive: read until two consecutive replies agree (ignoring
-        # the per-read counter at byte 294).  Cold reads converge in
-        # 2–5 attempts on v1.06 firmware.
         prev: bytes | None = None
-        reply_payload = b""
+        payload = b""
         for _ in range(max_attempts):
             reply = self.read_raw(cmd=cmd, category=CAT_PARAM, timeout_ms=3000)
-            reply_payload = reply.payload
-            if prev is not None and _payload_matches_ignoring_counter(
-                prev, reply_payload
-            ):
-                return reply_payload
-            prev = reply_payload
-        # Fell through max_attempts without convergence — return last
-        # read and let the caller notice if it's still divergent.
-        return reply_payload
+            payload = reply.payload
+            if prev is not None and payload == prev:
+                return payload
+            prev = payload
+        return payload
 
     @staticmethod
     def parse_channel_state_blob(blob: bytes, channel: int) -> dict | None:
         """Decode the full 296-byte per-channel state blob into a flat dict.
 
         The blob returned by ``cmd=0x77NN`` (read_channel_state) is the
-        firmware's per-channel struct in RAM.  Field offsets in the second
-        half (246..285) were confirmed live on real DSP-408 hardware and
-        align with the official Android leon v1.23 app's
-        ``DataStruct_Output`` layout shifted by 2 bytes.
+        firmware's per-channel struct in RAM.  Offsets verified
+        2026-04-22 against the Windows GUI capture blobs on the
+        reverse-engineering branch (79 captured read replies + writes —
+        100 % consistent with the offsets below).
 
         Layout (verified offsets — see protocol.py for symbolic names):
 
         .. code-block:: text
 
             0..79    parametric-EQ bands 0..9 (10 × 8-byte records)
-            80..245  unused / leon-style padding for the bands the GUI
-                     never exposes (writes to bands 10..30 silently no-op)
-            246      mute       1=audible, 0=muted (NOTE: inverted vs leon)
-            247      polar      0=normal, 1=phase-inverted (180°)
-            248-249  gain_le16  raw = (dB×10)+600; range 0..600 = -60..0 dB
-            250-251  delay_le16 samples (or cm-step index)
-            252      byte_252   semantic unknown — leon called it `eq_mode`
+            80..247  leon-style padding for higher band slots; firmware
+                     only exposes 10 PEQ bands so this whole region is
+                     effectively unused (writes to bands 10..30 silently
+                     no-op)
+            248      mute       1=audible, 0=muted (NOTE: inverted vs leon)
+            249      polar      0=normal, 1=phase-inverted (180°)
+            250-251  gain_le16  raw = (dB×10)+600; range 0..600 = -60..0 dB
+            252-253  delay_le16 samples (or cm-step index)
+            254      byte_252   semantic unknown — leon called it `eq_mode`
                                 but live probe proved writes here do NOT
                                 bypass EQ. Round-trips correctly; do not
-                                key automations on it.
-            253      spk_type   speaker-role index; default in CHANNEL_SUBIDX
-            254-255  hpf_freq_le16
-            256      hpf_filter (0=BW, 1=Bessel, 2=LR)
-            257      hpf_slope  (0..7 = 6/12/18/24/30/36/42/48 dB/oct, 8=Off)
-            258-259  lpf_freq_le16
-            260      lpf_filter
-            261      lpf_slope
-            262-269  mixer IN1..IN8 (8 × u8 percentage)
-            270-277  comp_shadow      (semantic unknown — reads identical
-                                       to the live compressor record but
-                                       does NOT track writes; see protocol)
-            278-279  all_pass_q_le16
-            280-281  attack_ms_le16   (compressor attack)
-            282-283  release_ms_le16  (compressor release)
-            284      threshold        (compressor)
-            285      linkgroup        (channel link/group index, 0=none)
-            286-293  name (8-byte ASCII channel label)
+                                key automations on it. (Historical name
+                                retained even though the offset is now 254.)
+            255      spk_type   speaker-role index; default in CHANNEL_SUBIDX
+            256-257  hpf_freq_le16
+            258      hpf_filter (0=BW, 1=Bessel, 2=LR, 3=alias for LR)
+            259      hpf_slope  (0..7 = 6/12/18/24/30/36/42/48 dB/oct, 8=Off)
+            260-261  lpf_freq_le16
+            262      lpf_filter
+            263      lpf_slope
+            264-271  mixer IN1..IN8 (8 × u8 percentage)
+            272-279  comp_shadow      (semantic unknown — on Windows GUI
+                                       captures mirrors the live compressor
+                                       record; on our spare reads as 8
+                                       spaces.  Not written by any cmd we
+                                       know of — likely a GUI-populated
+                                       "factory defaults" shadow.)
+            280-281  all_pass_q_le16
+            282-283  attack_ms_le16   (compressor attack)
+            284-285  release_ms_le16  (compressor release)
+            286      threshold        (compressor)
+            287      linkgroup        (channel link/group index, 0=none)
+            288-295  name (8-byte ASCII channel label)
 
         Returns the legacy keys (``db``, ``muted``, ``delay``, ``subidx``)
         plus the new keys (``polar``, ``byte_252``, ``spk_type``, ``hpf``,
         ``lpf``, ``mixer``, ``compressor``, ``linkgroup``, ``name``,
-        ``raw``).  ``byte_252`` is the raw value of blob[252] — semantic
-        unknown (was previously called ``eq_mode``; see protocol.py).
+        ``raw``).  ``byte_252`` is the raw value of ``blob[OFF_BYTE_252]`` —
+        the historical name is kept even though the actual offset is 254
+        in the current (corrected) layout.
 
         ``hpf``/``lpf`` are sub-dicts ``{"freq", "filter", "slope"}``.
         ``compressor`` is ``{"attack_ms", "release_ms", "threshold",
@@ -850,10 +800,10 @@ class Device:
             import logging
             logging.getLogger("dsp408.device").warning(
                 "get_channel(%d): could not parse 296-byte blob "
-                "(len=%d, blob[246:254]=%s). First 16 bytes: %s",
+                "(len=%d, blob[248:256]=%s). First 16 bytes: %s",
                 channel,
                 len(blob) if blob else 0,
-                blob[246:254].hex() if len(blob) >= 254 else "(short)",
+                blob[248:256].hex() if len(blob) >= 256 else "(short)",
                 blob[:16].hex() if blob else "(empty)",
             )
             return dict(self._channel_cache[channel])
@@ -882,7 +832,7 @@ class Device:
             01 00 | value_le_u32 | 00 | sub_index
 
         ``sub_index`` is the **speaker-role / channel-type byte** stored
-        at blob[253] (see :data:`protocol.CHANNEL_SUBIDX` and
+        at blob[255] (see :data:`protocol.CHANNEL_SUBIDX` and
         :data:`protocol.SPK_TYPE_NAMES`) — not a parameter selector as
         early reverse-engineering had hypothesized.  Prefer the typed
         wrappers (:meth:`set_channel`, :meth:`set_eq_band`,
@@ -956,7 +906,7 @@ class Device:
                          polar: bool = False) -> bytes:
         """Build the 8-byte per-channel write payload (cmd=0x1FNN).
 
-        Layout (verified live on hardware, matches blob[246..253] read-back):
+        Layout (verified live on hardware, matches blob[248..255] read-back):
 
         .. code-block:: text
 
@@ -964,7 +914,7 @@ class Device:
             [1] polar     0=normal, 1=phase-inverted (180°)
             [2..3] gain_le16  raw = (dB×10)+600
             [4..5] delay_le16 samples
-            [6] byte_6    semantic unknown — stored at blob[252] but does
+            [6] byte_6    semantic unknown — stored at blob[254] but does
                           NOT bypass EQ (was hypothesized to be `eq_mode`,
                           disproved live; see protocol.OFF_BYTE_252).
                           We always write 0 here.
@@ -973,7 +923,7 @@ class Device:
         Args:
             polar: 180° phase invert. Empirically validated via Scarlett
                 loopback on real hardware (Δphase = ±180° with 6° jitter).
-            sub_index: DSP channel-type byte (blob[253]).  Pass the value
+            sub_index: DSP channel-type byte (blob[255]).  Pass the value
                 previously returned by ``get_channel()["subidx"]`` to
                 preserve the firmware's type assignment.  If None, falls
                 back to ``CHANNEL_SUBIDX[channel]`` (factory defaults).
@@ -1002,7 +952,7 @@ class Device:
     # match the device's power-up state.
     #
     # The `subidx` field is populated by get_channel() from the live device
-    # read (blob[253]).  Using the actual discovered value rather than the
+    # read (blob[255]).  Using the actual discovered value rather than the
     # CHANNEL_SUBIDX table default ensures that set_channel() preserves the
     # firmware's DSP type assignment even when a device is configured with a
     # non-default type (e.g. ch1 with subidx=0x12 on some devices).
@@ -1280,7 +1230,7 @@ class Device:
         self.set_routing_levels(output_idx, levels)
 
     # ── crossover (HPF + LPF per channel) ──────────────────────────────
-    # Filter type values for blob[256] (HPF) and blob[260] (LPF).  The
+    # Filter type values for blob[258] (HPF) and blob[262] (LPF).  The
     # Windows GUI dropdown labels them "Butterworth / Bessel / Linkwitz-
     # Riley / Defeat".  Empirically validated 2026-04-19 via Scarlett
     # loopback + discrete-tone sweep — see
@@ -1320,7 +1270,7 @@ class Device:
         Encoding decoded from ``captures/full-sequence.pcapng`` (Windows
         DSP-408 V1.24 GUI changing filter types) and verified live on
         real hardware 2026-04-19 — the 8-byte payload mirrors
-        ``blob[254..261]`` exactly, so a write here shows up surgically
+        ``blob[256..263]`` exactly, so a write here shows up surgically
         at those offsets in the next ``read_channel_state()`` blob.
 
         Args:
@@ -1503,7 +1453,7 @@ class Device:
               not expose any compressor controls anywhere.** Confirms
               the feature was scrubbed from the user-facing UI too.
 
-        Wire encoding is decoded + round-trip-verified at blob[278..285]
+        Wire encoding is decoded + round-trip-verified at blob[280..287]
         per leon DataID=35:
 
         ====  ================  ==================================
@@ -1616,7 +1566,7 @@ class Device:
             mode, mute, delay_le16, volume
           * Unknown subsystem at blob[78..85] (DataID=10)
           * Input noisegate at blob[86..93] (DataID=11)
-          * XOR checksum at blob[286]
+          * XOR checksum at blob[288]
         """
         if not 0 <= input_ch < INPUT_CHANNEL_COUNT:
             raise ValueError(
@@ -1837,17 +1787,17 @@ class Device:
         verified byte-for-byte against the captured GUI bytes 2026-04-19;
         device acks the write).
 
-        ⚠ **2-byte payload loss is inherent to the firmware's
-        multi-frame WRITE handling.** Live-verified 2026-04-19: the
-        firmware appears to consume only 48 bytes of payload from the
-        first HID frame even though the GUI sends 50 (and we faithfully
-        replicate this), then starts continuation frames at logical-
-        payload offset 48. Net effect: bytes 48..49 of the input
-        ``blob`` are SILENTLY DROPPED. The Windows GUI exhibits the
-        same behavior — replaying the captured GUI bytes verbatim
-        produces the same readback. Workaround: read after the write
-        and verify; or pad your blob's bytes 48..49 with the same
-        values as bytes 50..51 to make the loss invisible.
+        **Round-trip is byte-exact** as of 2026-04-22.  Previous
+        versions of this docstring claimed a "2-byte payload drop at
+        offsets 48..49" attributed to a firmware quirk in the
+        multi-frame WRITE path, and recommended padding
+        ``blob[48..49]`` to match ``blob[50..51]`` as a workaround.
+        That conclusion was wrong: the "drop" was actually a bug in
+        :func:`dsp408.protocol.parse_frame` that under-read the first
+        frame of multi-frame READ replies by 2 bytes, making
+        post-write reads LOOK like bytes 48..49 of the write had been
+        lost.  With the parser fixed, writes land byte-exactly and no
+        padding workaround is needed.
         """
         if len(blob) != 296:
             raise ValueError(f"blob must be 296 bytes, got {len(blob)}")
@@ -1915,7 +1865,7 @@ class Device:
 
         Per leon source ``OutputSPKSetActivity.java``, picking a speaker
         role in the GUI just writes a single integer to the per-output
-        ``spk_type`` byte (blob[253]). leon does NOT cascade
+        ``spk_type`` byte (blob[255]). leon does NOT cascade
         EQ/crossover writes from a template lookup table — the firmware
         DSP itself owns whatever happens.
 

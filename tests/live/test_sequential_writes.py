@@ -24,7 +24,7 @@ def test_sequential_set_channel(dsp, n):
             dsp.set_channel(3, db=want_db, muted=False)
             time.sleep(0.05)
             blob = dsp.read_channel_state(3)
-            raw = struct.unpack("<H", blob[248:250])[0]
+            raw = struct.unpack("<H", blob[250:252])[0]
             actual_db = (raw - 600) / 10.0
             if abs(actual_db - want_db) >= 0.05:
                 failures.append((i, want_db, actual_db))
@@ -71,7 +71,7 @@ def test_sequential_set_channel_no_sleep(dsp):
         # Settle, then check the LAST write landed
         time.sleep(0.2)
         blob = dsp.read_channel_state(3)
-        raw = struct.unpack("<H", blob[248:250])[0]
+        raw = struct.unpack("<H", blob[250:252])[0]
         actual_db = (raw - 600) / 10.0
         assert abs(actual_db - (-10.0)) < 0.05, (
             f"last of 10 no-sleep writes didn't land: got {actual_db}"

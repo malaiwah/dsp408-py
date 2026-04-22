@@ -1,190 +1,186 @@
 # Known firmware / driver quirks
 
 Empirical findings from live-hardware regression testing on
-`MYDW-AV1.06` (v1.06), 2026-04-22.  All of these are firmware-level
-quirks; the library's job is to either paper over them transparently
-or document them so callers can.
+`MYDW-AV1.06` (v1.06), last overhauled 2026-04-22.  This file used to
+have 8 entries; several were phantoms attributed to the firmware that
+turned out to share a single root cause in *this* library's parser.
 
 See `tests/live/` for the live-hardware regression suite that locks in
-each of these characterisations.
+each real quirk.
 
-## 1. Read-divergence on early-session reads
+## ❌ Not firmware quirks — single library bug
 
-**Where:** `read_channel_state(ch)` — the 296-byte multi-frame read at
-`cmd=0x77NN`.
+Pre-2026-04-22 this document catalogued two separate "firmware quirks"
+that both traced to the same bug in
+[`dsp408/protocol.py::parse_frame`](../dsp408/protocol.py):
 
-**Symptom:** In the first few reads of each channel in a fresh
-session, the firmware occasionally returns a blob whose upper bytes
-(offsets ≈48..245, the EQ band region) are 2 bytes left-shifted from
-the device's actual stored state.  Measured rate on one device:
-**6 out of the first 100 reads of ch3, all within the first 6
-reads**; 0/94 thereafter.  The semantic per-channel record (mute /
-gain / delay / crossover / routing / compressor / name at offsets
-244..293) was **not** affected in any observed trial.
+- **"Read-divergence on early-session reads"** (the one that made
+  ~6 % of early reads return a 2-byte left-shifted blob).
+- **"Multi-frame WRITE 2-byte payload drop"** (the one that made
+  full-channel-state writes look like they lost bytes 48..49).
 
-**Consequence:** byte-exact diffs of read blobs across a write
-boundary can falsely flag "cross-channel mutation" when all that
-happened was the baseline snapshot caught a shifted variant.  This
-was the root cause of most of the originally-reported "bugs" (cross-
-channel wipe from `set_routing`, silent no-op of `set_eq_band` for
-`ch>0 band=0`, etc.) — none of those were real.
+Both were a single line in `parse_frame`: the function capped the first
+frame's payload at 48 bytes (reserving 2 for the chk + end markers),
+but **multi-frame first frames carry 50 payload bytes — no chk/end in
+the first frame** (they go at the tail of the last continuation per the
+wire spec).  Every multi-frame READ reply was losing 2 bytes, causing
+every byte from offset 48 onward to appear 2 positions earlier in the
+reassembled blob.
 
-**Library fix** (`dsp408/device.py::read_channel_state`):
-- `Device.connect()` does a warmup pass (2 rounds × 8 channels) to
-  drain the cold-read window.
-- `read_channel_state()` defaults to an **adaptive** read-until-
-  stable: it re-reads up to 6 times, returning the first blob that
-  matches the previous blob (ignoring the per-read counter at byte
-  294).  In practice converges in 2–3 attempts on warm channels.
-- Pass `double_read=False` to skip the adaptive retry (MQTT live-
-  status path uses this for lower latency; the divergence affects
-  the EQ region which MQTT doesn't poll).
+Write-then-read tests that seemed to show "bytes 48..49 of my write got
+lost" were actually showing "my read-back of the full 296 bytes is 2
+positions left-shifted, so bytes I put at offset 50 appear to be at
+offset 48."
 
-**Wireshark visible:** A dissected live-test capture shows this as
-`HPF=256Hz` on channels 0..7 during the connect warmup — pure shift
-artifact, not real state.
+Fixed by patching `parse_frame` to detect multi-frame first frames
+(`payload_len > 48`) and read the full 50 payload bytes in that case.
+Verified against the Windows GUI capture blobs on the
+`reverse-engineering` branch: 79/79 capture blobs decoded via the
+Wireshark Lua dissector's (independently-correct) reassembly match
+exactly what the fixed Python parser now produces.
 
-## 2. Multi-frame WRITE 2-byte payload drop
+**Cascading impact of the fix:**
+- Every `OFF_*` constant for offsets ≥48 in `dsp408/protocol.py`
+  shifted +2.  (The old values were correct for the buggy-reassembly
+  view; the new values are correct for the firmware's actual layout.)
+- The "adaptive double-read" + "connect-time warmup" logic in
+  `Device.read_channel_state` / `Device.connect` was removed — reads
+  are byte-exact on every call now.
+- The `_payload_matches_ignoring_counter` helper + the "byte 294 is a
+  per-read counter" narrative were removed.  Byte 294 was never a
+  counter; the buggy reassembly was just exposing random trailing
+  padding bytes of the last HID continuation frame.
+- `UNSTABLE_READ_REGION` in `tests/live/conftest.py` was zeroed out.
+- The `set_full_channel_state` "pad blob[48..49] to match
+  blob[50..51]" workaround was removed — full-channel writes now
+  round-trip byte-exactly.
 
-**Where:** `set_full_channel_state(ch, blob)` — the 296-byte multi-
-frame write at `cmd=0x10000..0x10003` (ch 0..3) / `cmd=0x04..0x07`
-(ch 4..7).
+## Real quirks that remain
 
-**Symptom:** The firmware appears to consume only 48 bytes of payload
-from the first HID frame even though the capture shows 50, then
-starts continuation frames at logical-payload offset 48.  Net effect:
-bytes 48..49 of the input blob are **silently dropped** and
-everything after gets left-shifted by 2 bytes in internal storage.
-
-**Windows GUI exhibits the same behavior** — replaying the captured
-GUI bytes verbatim produces the same readback, so this is a firmware
-bug, not ours.
-
-**Workaround:** pad `blob[48..49]` to match `blob[50..51]` before
-writing, so the 2-byte drop becomes invisible.  Or don't use
-`set_full_channel_state` for partial updates — use the surgical
-setters (`set_channel`, `set_routing`, `set_crossover`,
-`set_eq_band`, `set_compressor`, `set_channel_name`) instead.
-
-## 3. EQ bands 6..9 storage layout is not `band * 8`
+### 1. EQ bands 6..9 storage layout isn't `band * 8`
 
 **Where:** `set_eq_band(ch, band=6..9, ...)` writes.
 
-**Symptom:** Writes to bands 6..9 are accepted by the firmware and
-round-trip via the library, but the values don't appear at the
-expected offsets `blob[band * 8 .. band * 8 + 4]`.  Bands 0..5 do
-use the `band * 8` stride and are verified surgical.
+**Symptom:** Writes are accepted and round-trip, but don't show up at
+the expected offsets `blob[band * 8 .. band * 8 + 4]`.  Bands 0..5 do
+use the `band * 8` stride.
 
-**Why:** The Windows GUI only exposes 6 PEQ bands per channel, and
-the firmware's internal storage for the remaining "leon-style" 4
-bands (if they exist at all) is not at simple 8-byte strides.
-Decoding left for a future reverse-engineering session.  See
-`notes/blob-layout-verification.md` on the `reverse-engineering`
-branch.
+**What's really in that region (offsets 48..245)?**  Pre-2026-04-22
+docs called it "leon-style padding for unused band slots" but that's
+likely wrong — the region holds SOMETHING that occasionally differs
+between otherwise-consecutive reads (see the residual read-divergence
+on bytes 48..79).  Possibilities under investigation:
+- Additional internal per-band records (e.g. computed filter
+  coefficients cached from the 6 user-facing bands).
+- State for undocumented opcodes we haven't decoded yet (a parallel
+  RE session is working on this).
+- A genuine cached / transient state machine that can legitimately
+  flip between two valid forms.
 
-**Consequence for users:** use bands 0..5.  Writes to 6..9 aren't
-forbidden, but readback won't line up with your intent.
+Until that session concludes, treat 48..245 as **region of unknown
+semantics**, not "padding".
 
-## 4. Byte 294 is a per-read counter
+**Consequence for users:** use bands 0..5 for EQ.  Writes to 6..9
+aren't forbidden but readback won't line up with your intent.  Don't
+key automations on bytes 48..245.
 
-**Where:** Every 296-byte channel-state blob.
+### 2. Compressor block is inert in firmware v1.06
 
-**Symptom:** Byte 294 increments with every read even when the
-channel state hasn't changed.  It's not a state field — just a
-liveness counter.
+**Where:** `set_compressor()` (cmd=0x2300+ch) writes to blob[280..287].
 
-**Consequence:** Tests that diff blobs across reads must mask byte
-294, or they'll see phantom changes on every read.  The library's
-internal adaptive-read logic already ignores byte 294 when checking
-read convergence.
+**Symptom:** Writes land byte-exactly, but the audio engine ignores
+every parameter combination.  Four-way confirmation (live audio rig,
+firmware disasm, leon Android source, Windows UI inspection) shows the
+block is not wired to audio.
 
-## 5. Compressor block is inert in firmware v1.06
+**Consequence:** `set_compressor` round-trips correctly for state
+storage / preset preservation, but doesn't affect audio.  The Windows
+GUI V1.24 doesn't expose compressor controls anywhere — Dayton seems
+to have dropped the feature from the user-facing product.
 
-**Where:** `set_compressor(ch, attack, release, threshold, ...)` —
-the write at `cmd=0x2300+ch` targeting blob[278..285].
+### 3. Compressor shadow at offsets 272..279
 
-**Symptom:** Writes land byte-exactly in the blob, but audio
-compression is not applied at any parameter combination.
-Four-way confirmation (live audio rig, firmware disasm, leon source,
-Windows UI) shows the block is inert.
+**Where:** 296-byte channel-state blob, offsets 272..279.
 
-**Consequence:** `set_compressor` round-trips correctly for state-
-storage purposes but doesn't affect audio.  MQTT / UI can still
-expose these controls if you want to preserve user-set values
-across sessions, but don't advertise them as "compression works".
+**Symptom:** On Windows GUI captures this region mirrors the live
+compressor record at 280..287 (same factory-default bytes).  On our
+spare device it reads as 8 × 0x20 (spaces) and doesn't track
+writes to cmd=0x2300+ch (those only hit 280..287).
 
-## 6. Compressor shadow at offsets 270..277
+**Consequence:** Treat 272..279 as read-only / GUI-populated; always
+write compressor via cmd=0x2300+ch (→ 280..287).  Reading 272..279 may
+be useful for diagnostics ("what did the GUI set as the default Q?")
+but nothing else.
 
-**Where:** 296-byte channel-state blob, offsets 270..277.
+### 4. Cross-session persistence requires `save_preset()` for flash
 
-**Symptom:** Reads from this region return identical default values
-to the active compressor record (offsets 278..285) but writes
-targeting 270..277 are silently ignored — it's a read-only firmware
-"factory defaults" shadow.
-
-**Consequence:** Always write compressor params to 278..285 via
-`set_compressor`.  Reading 270..277 is useful for
-"what-were-the-defaults" diagnostics but nothing else.
-
-## 7. Test-session-order quirk: `set_eq_band(ch∈{5,6,7}, band=0)` drops late in a rapid chain
-
-**Where:** `set_eq_band()` writes with `channel ∈ {5, 6, 7}` and
-`band = 0` specifically, ONLY when they run as part of a long rapid
-sequence of other `set_eq_band` writes.
-
-**Symptom:** The write is accepted (WR_ACK received) but the value
-doesn't appear in the blob on the next read.
-
-**Reproducibility:**
-- **Direct isolated probe** (fresh session, reset defaults, write,
-  read) → ALL channels × band 0 round-trip correctly.
-- **Batch test** (`test_all_eq_verified_positions_round_trip`,
-  writes all 48 positions sequentially then reads) → all 48 land.
-- **Interleaved test chain** (`test_set_eq_band_lands_correctly`
-  parametrised [band, ch]) → consistently fails for band=0,
-  ch∈{5,6,7}, passes for all other combinations.
-
-**Status:** Not a library bug per the first two reproduction paths.
-Possibly a firmware cmd-dispatch history effect (cmd=0x10005..0x10007
-share low 16 bits with full-channel-state cmd=0x04..0x07 for
-ch4..ch7).  The 3 affected test cases are marked `xfail` in
-`tests/live/test_surgical_writes.py::test_set_eq_band_lands_correctly`
-with a pointer to this note.  Revisit if/when the Wireshark dissector
-+ byte-level replay against Windows captures (planned follow-up)
-reveals what the GUI does differently.
-
-## 8. Cross-session persistence requires `save_preset()` for flash storage
-
-**Where:** Every mutating public API (`set_channel`, `set_routing`,
-`set_crossover`, `set_eq_band`, `set_channel_name`, etc.).
+**Where:** Every mutating public API.
 
 **Symptom:** Writes land in RAM and persist across a
 `Device.close() + Device.open()` within the same USB power cycle
-(verified by `tests/live/test_persistence_reopen.py`).  But they do
-NOT necessarily survive a USB power cycle (yank + replug).  Cross-
-power-cycle persistence is via the firmware's preset subsystem —
-calling `save_preset(name)` commits the current state to internal
-flash.
+(verified by `tests/live/test_persistence_reopen.py`).  They don't
+necessarily survive a USB power cycle — preset-slot flash writes are
+the firmware's persistence mechanism; call `save_preset(name)` after
+whatever change you want to keep.
 
-**Consequence:** If your application needs tuning to survive reboots
-of the DSP, call `save_preset()` after whatever change you made.
-The library defaults to "write to RAM only" because that's what the
-Windows GUI does for live tweaks, and preset-slot writes are a
-user-intent action.
+**Consequence:** MQTT / UI applications that want user tweaks to
+survive reboots of the DSP should expose a "Save Preset" control and
+invite the user to click it after tuning.
+
+### 5. `0xAA` fill in uninitialized channel regions
+
+**Where:** Channel blobs for output channels that have never had a
+preset loaded for them.
+
+**Symptom:** Bytes in the name (288..295) / compressor (280..287) /
+EQ-region (48..245) of uninitialized channels frequently contain
+`0xAA` padding bytes.  Configured channels have meaningful values
+there.
+
+**Consequence (and silver lining):** The `0xAA` fill is a usable
+signal for "is this channel configured?" detection — if a read
+returns a channel blob whose name field is heavy with `0xAA` bytes,
+the channel almost certainly hasn't been through a preset-load or
+explicit configuration cycle.  Useful when bootstrapping new DSPs.
+
+### 6. Test-session-order quirk: some `set_eq_band` rapid-chain writes drop
+
+**Where:** `set_eq_band()` calls in the middle of a long rapid
+sequential-write chain — the specific `(channel, band)` that drops
+varies between runs depending on cumulative session state.  Observed
+groupings: `(5..7, band=0)`, `(1..3, band=3)`, `(5..7, band=3)`.
+
+**Symptom:** Write is accepted (WR_ACK received) but the value
+doesn't appear in the blob on the next read.  The same write in
+isolation (fresh session, reset defaults, write, read) lands
+correctly on all channels.  The batch test
+``test_all_eq_verified_positions_round_trip`` passes for every
+``(channel, band=0..5)`` combination.
+
+**Status:** Not a library bug per isolated reproduction.  Possibly a
+firmware cmd-dispatch history effect combined with the "startup
+write-drop quirk" that needs ~5–6 warmup writes.  The affected test
+cases are marked `xfail` in
+``tests/live/test_surgical_writes.py::test_set_eq_band_lands_correctly``.
+Worth revisiting now that we can do byte-level capture + replay
+against the Windows GUI via the Wireshark dissector.
 
 ## Wireshark visibility
 
-Every one of these quirks is visible in Wireshark captures via the
-provided dissector (`tools/wireshark/dsp408.lua`).  A live-test run
-(`tests/live/` against the device on `raslabel`) produces a 12,000+
-frame capture that dissects cleanly end-to-end, including multi-
-frame reassembly and semantic decoding of every `set_*` write's
-payload.  If a new quirk is reported, the first diagnostic step
-should be:
+Every real (and former) quirk is visible in Wireshark captures via the
+provided dissector (`tools/wireshark/dsp408.lua`).  A live-test run on
+raslabel produces a ~12,000-frame capture that dissects cleanly end-to-
+end including multi-frame reassembly and semantic decoding of every
+`set_*()` write's payload.  First diagnostic step for any new
+quirk report:
 
 1. USBPcap (Windows) or `usbmon` (Linux) the traffic while
    reproducing.
 2. Open in Wireshark with the dissector loaded.
-3. Compare command sequence to a known-good capture on the
+3. Compare the command sequence to a known-good capture on the
    `reverse-engineering` branch (`captures/full-sequence.pcapng` is
    the gold standard).
+4. If the new capture shows different bytes at the same offset than
+   we'd predict, check whether our library's view of that offset
+   matches the dissector's — the dissector is now the authoritative
+   reference for the on-wire layout.

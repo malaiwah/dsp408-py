@@ -272,21 +272,57 @@ def parse_frame(raw: bytes) -> Frame | None:
     cmd = struct.unpack_from("<I", raw, 8)[0]
     payload_len = struct.unpack_from("<H", raw, 12)[0]
 
-    # Bytes actually present in this frame (may be less than payload_len)
-    max_in_frame = FRAME_SIZE - HEADER_SIZE - 2
-    present = min(payload_len, max_in_frame, len(raw) - HEADER_SIZE - 2)
+    # Bytes actually present in this frame.
+    #
+    # Single-frame payloads: header (14) + payload (≤48) + chk (1) + end (1) = 64.
+    # Multi-frame FIRST frames carry 50 payload bytes — no chk/end markers are
+    # present in the first frame.  The chk/end go at the tail of the LAST
+    # continuation frame (see build_frame / build_frames_multi).  The
+    # ``payload_len`` field in the header declares the FULL logical payload
+    # length, so any value > 48 means this is a multi-frame first frame and
+    # this parse needs to extract 50 bytes, not 48.
+    #
+    # Historical note: an earlier version of this function capped ``present``
+    # at 48 for all frames.  That silently dropped 2 bytes of the first frame
+    # on every multi-frame READ (e.g. the 296-byte channel-state reply at
+    # cmd=0x77NN), producing a reassembled blob where every byte from offset
+    # 48 onward was 2 bytes left-shifted relative to the firmware's intent.
+    # That bug was the root cause of the documented "read-divergence quirk"
+    # and "firmware drops 2 bytes of multi-frame WRITE" phantoms that
+    # pre-2026-04-22 versions of this library + its docs attributed to the
+    # firmware.  Both were this parser under-reading by 2 bytes.  Confirmed
+    # by comparing raw capture frames against dsp408.lua's reassembly (which
+    # correctly uses 50 bytes for multi-frame first frames) — after the fix,
+    # the Python library's reassembled blobs match the Wireshark dissector's
+    # byte-for-byte and line up with Windows GUI capture payloads.
+    is_multi_frame_first = payload_len > FRAME_SIZE - HEADER_SIZE - 2  # > 48
+    if is_multi_frame_first:
+        max_in_frame = FRAME_SIZE - HEADER_SIZE       # 50 — no chk/end in first
+        max_available = len(raw) - HEADER_SIZE
+    else:
+        max_in_frame = FRAME_SIZE - HEADER_SIZE - 2   # 48 — chk+end at tail
+        max_available = len(raw) - HEADER_SIZE - 2
+    present = min(payload_len, max_in_frame, max_available)
     if present < 0:
         present = 0
     payload = bytes(raw[HEADER_SIZE : HEADER_SIZE + present])
 
-    chk_pos = HEADER_SIZE + present
-    if chk_pos < len(raw):
-        checksum = raw[chk_pos]
-        chk_region = raw[4:chk_pos]
-        checksum_ok = xor_checksum(chk_region) == checksum
-    else:
+    if is_multi_frame_first:
+        # First frames of multi-frame payloads don't carry chk/end — they
+        # live at the tail of the last continuation.  Mark checksum as
+        # unverified here; multi-frame reassembly in transport.read_response
+        # is responsible for validating the full reassembled payload.
         checksum = 0
         checksum_ok = False
+    else:
+        chk_pos = HEADER_SIZE + present
+        if chk_pos < len(raw):
+            checksum = raw[chk_pos]
+            chk_region = raw[4:chk_pos]
+            checksum_ok = xor_checksum(chk_region) == checksum
+        else:
+            checksum = 0
+            checksum_ok = False
 
     return Frame(
         direction=direction,
@@ -372,7 +408,7 @@ CMD_WRITE_GLOBAL = 0x2000       # writes global params; the ONE captured use
 
 # Per-channel compressor write (0x2300..0x2307 = ch1..ch8). 8-byte payload
 # decoded from captures/windows-04b-volumes-mute-presets.pcapng + verified
-# live to land at blob[278..285]; per leon v1.23 source the field layout is:
+# live to land at blob[280..287]; per leon v1.23 source the field layout is:
 #     [0..1]  all_pass_q_le16   (sidechain Q; firmware default 420)
 #     [2..3]  attack_ms_le16    (firmware default 56)
 #     [4..5]  release_ms_le16   (firmware default 500)
@@ -386,7 +422,7 @@ CMD_WRITE_COMPRESSOR_BASE = 0x2300
 
 # Per-channel name write (0x2400..0x2407 = ch1..ch8). 8 bytes ASCII,
 # zero-padded. Per leon v1.23 DataOptUtil.java:1138-1147 (DataID=36).
-# Lands at blob[286..293] (default = 8 spaces + 0x00 trailing).
+# Lands at blob[288..295] (default = 8 spaces + 0x00 trailing).
 CMD_WRITE_CHANNEL_NAME_BASE = 0x2400
 
 # Per-channel mixer SECOND HALF write (0x2200..0x2207 = ch1..ch8).
@@ -447,7 +483,7 @@ CMD_PRESET_SAVE_TRIGGER = 0x34
 PRESET_SAVE_TRIGGER_BYTE = 0x01
 
 # Per-channel HPF + LPF crossover writes (0x12000..0x12007 = ch1..ch8).
-# 8-byte payload mirrors blob[254..261] exactly:
+# 8-byte payload mirrors blob[256..263] exactly:
 #     [0..1]  HPF freq  Hz LE16  (default 20)
 #     [2]     HPF filter type    (0=BW, 1=Bessel, 2=LR, 3=?)
 #     [3]     HPF slope          (0..7 = 6/12/18/24/30/36/42/48 dB/oct, 8=Off)
@@ -517,7 +553,7 @@ EQ_GAIN_RAW_MIN  = 0      # = -60 dB
 EQ_GAIN_RAW_MAX  = 1200   # = +60 dB (envelope; only +12 dB verified live)
 
 # Subidx for each of the 8 channel write cmds. Order matches cmd index 0..7.
-# These are also the *spk_type* (speaker-role) values stored at blob[253] of
+# These are also the *spk_type* (speaker-role) values stored at blob[255] of
 # the per-channel state — confirmed by cross-reference with the official
 # Android app's leon.android.chs_ydw_dcs480_dsp_408 v1.23 (DataStruct_Output
 # field naming + the 25-entry speaker-role table).
@@ -541,63 +577,74 @@ ROUTING_OFF = 0x00
 # showed 31 addressable slots.
 BLOB_SIZE = 296
 
-# Basic per-channel record (8 bytes at 246..253) — also the write payload format
+# Basic per-channel record (8 bytes at 248..255) — also the write payload format
 # accepted by cmd=0x1FNN.
-OFF_MUTE        = 246  # 1=audible, 0=muted (INVERTED from leon's polarity)
-OFF_POLAR       = 247  # phase invert: 0=normal, 1=inverted (180°)
-OFF_GAIN        = 248  # u16 LE; raw = (dB * 10) + 600; range 0..600 = -60..0 dB
-OFF_DELAY       = 250  # u16 LE; samples — exact 1:1, capped at 359 (firmware
+#
+# Offsets on this page were corrected 2026-04-22 after the parse_frame fix:
+# earlier versions of this library under-read the first frame of multi-frame
+# replies by 2 bytes (reading 48 instead of 50 payload bytes), which made
+# every blob position from firmware-offset 50 onward appear 2 bytes earlier
+# in the reassembled blob.  The offsets below are the TRUE firmware-side
+# positions, verified against the Windows GUI captures on the
+# reverse-engineering branch (``captures/load_loaddisk_save_preset_bureau.pcapng``
+# and ``captures/reset_to_defaults.pcapng``: 48/48 reassembled blobs show
+# Q=420 at offset 280 and name-default spaces at 288..295).
+OFF_MUTE        = 248  # 1=audible, 0=muted (INVERTED from leon's polarity)
+OFF_POLAR       = 249  # phase invert: 0=normal, 1=inverted (180°)
+OFF_GAIN        = 250  # u16 LE; raw = (dB * 10) + 600; range 0..600 = -60..0 dB
+OFF_DELAY       = 252  # u16 LE; samples — exact 1:1, capped at 359 (firmware
                        # clamps; matches 8.14 ms @ 44.1 kHz, 7.48 ms @ 48 kHz).
                        # Empirical: tests/loopback/test_delay_calibration.py
-OFF_BYTE_252    = 252  # Semantic unknown. Initially hypothesized to be the
+OFF_BYTE_252    = 254  # Semantic unknown. Initially hypothesized to be the
                        # EQ enable/bypass flag (per the leon decompile's
                        # ``eq_mode`` field name) but live probe
                        # ``tests/loopback/_probe_eq_mode.py`` proved that
                        # writes to byte[6] of the channel write payload
-                       # round-trip to blob[252] yet do NOT bypass EQ.
+                       # round-trip to blob[254] yet do NOT bypass EQ.
                        # Kept exposed under a neutral name; do NOT key
-                       # automations on it.
+                       # automations on it.  (Name kept for backward compat
+                       # with the old "252" label — value is now 254.)
 OFF_EQ_MODE     = OFF_BYTE_252  # DEPRECATED alias — will be removed; the
                                 # name is misleading (see OFF_BYTE_252).
-OFF_SPK_TYPE    = 253  # speaker-role index; one of CHANNEL_SUBIDX by default
+OFF_SPK_TYPE    = 255  # speaker-role index; one of CHANNEL_SUBIDX by default
 
-# Crossover (HPF + LPF) — 8 bytes at 254..261
-OFF_HPF_FREQ    = 254  # u16 LE Hz (or table index)
-OFF_HPF_FILTER  = 256  # 0=Butterworth, 1=Bessel, 2=Linkwitz-Riley
-OFF_HPF_SLOPE   = 257  # 0..7 = 6/12/18/24/30/36/42/48 dB/oct, 8=Off
-OFF_LPF_FREQ    = 258
-OFF_LPF_FILTER  = 260
-OFF_LPF_SLOPE   = 261
+# Crossover (HPF + LPF) — 8 bytes at 256..263
+OFF_HPF_FREQ    = 256  # u16 LE Hz (or table index)
+OFF_HPF_FILTER  = 258  # 0=Butterworth, 1=Bessel, 2=Linkwitz-Riley
+OFF_HPF_SLOPE   = 259  # 0..7 = 6/12/18/24/30/36/42/48 dB/oct, 8=Off
+OFF_LPF_FREQ    = 260
+OFF_LPF_FILTER  = 262
+OFF_LPF_SLOPE   = 263
 
-# Mixer — 8 bytes at 262..269 (one u8 percentage per input source IN1..IN8).
+# Mixer — 8 bytes at 264..271 (one u8 percentage per input source IN1..IN8).
 # leon's data model has 16 cells per output but our firmware exposes 8.
-OFF_MIXER       = 262
+OFF_MIXER       = 264
 MIXER_CELLS     = 8
 
-# 8 bytes at 270..277 — semantic UNKNOWN. Reads identical to the
-# compressor record (270..277 always holds Q=420, attack=56, release=500,
-# threshold=0, linkgroup=0 — i.e. the firmware compressor defaults), but
-# **writes to it via cmd=0x2300+ch land at 278..285, not here**, and we
-# never see this region change in any read. Best guess: a read-only
-# "factory default" shadow / pre-init mirror used by the GUI's "Reset
-# Compressor" button. Offsets verified live 2026-04-19 via distinctive
-# byte injection — see the live smoke test in commit log.
-OFF_COMP_SHADOW = 270  # 8 bytes; do not interpret as live compressor
+# 8 bytes at 272..279 — semantic UNKNOWN. On Windows GUI captures this
+# region mirrors the live compressor record (holding the same Q=420 /
+# attack=56 / release=500 / threshold=0 / linkgroup=0 bytes as 280..287).
+# On our spare device however, 272..279 reads as 8 × 0x20 (spaces) — the
+# firmware default compressor values don't appear to be "pre-written" to
+# the shadow unless the preset-load path has touched it.  Writes to
+# cmd=0x2300+ch land at 280..287 (LIVE), not here, and we've never seen
+# this region change in any live probe.  Best guess: a read-only
+# "factory default" / GUI-populated shadow used by the (hidden)
+# "Reset Compressor" button.
+OFF_COMP_SHADOW = 272  # 8 bytes; do not interpret as live compressor
 
-# Compressor / dynamics + link group — 8 bytes at 278..285 (LIVE; the
+# Compressor / dynamics + link group — 8 bytes at 280..287 (LIVE; the
 # location that cmd=0x2300+ch writes to and reads from).
-OFF_ALL_PASS_Q  = 278  # u16 LE
-OFF_ATTACK_MS   = 280  # u16 LE
-OFF_RELEASE_MS  = 282  # u16 LE
-OFF_THRESHOLD   = 284  # u8 (encoding TBD; likely dB-scaled)
-OFF_LINKGROUP   = 285  # u8 channel link/group index (0 = no link)
+OFF_ALL_PASS_Q  = 280  # u16 LE
+OFF_ATTACK_MS   = 282  # u16 LE
+OFF_RELEASE_MS  = 284  # u16 LE
+OFF_THRESHOLD   = 286  # u8 (encoding TBD; likely dB-scaled)
+OFF_LINKGROUP   = 287  # u8 channel link/group index (0 = no link)
 
-# Per-channel name — 8 bytes ASCII at 286..293 (default: 8 × 0x20 spaces +
-# 0x00 trailing). Verified live 2026-04-19 via blob dump; previous
-# protocol.py had this at 278 which actually overlapped the live
-# compressor record (the misalignment was hidden by both regions
-# defaulting to identical "all spaces / zero" patterns).
-OFF_NAME        = 286
+# Per-channel name — 8 bytes ASCII at 288..295 (default: 8 × 0x20 spaces —
+# or "7 spaces + 0x00" if the firmware NUL-terminates short names).  This
+# is the last field in the 296-byte blob.
+OFF_NAME        = 288
 NAME_LEN        = 8
 
 # Filter type / slope enums (for select-style controls in MQTT discovery).

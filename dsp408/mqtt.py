@@ -439,7 +439,7 @@ class DeviceWorker:
                 for n in range(1, 9)
             },
             # ── Per-output channel name (8-byte ASCII label, r/w). ──
-            # Wire: cmd=0x2400+ch (DataID=36), lands at blob[286..293].
+            # Wire: cmd=0x2400+ch (DataID=36), lands at blob[288..295].
             # Live-verified 2026-04-19. Lets HA users name channels
             # "TWEETER", "SUB-LEFT", etc., from the dashboard.
             **{
@@ -898,7 +898,7 @@ class DeviceWorker:
                 continue
             self._publish_channel_state(n, state)
             # Per-channel name surfaces as its own text entity so users
-            # can rename from HA. Live-readback from blob[286..293] —
+            # can rename from HA. Live-readback from blob[288..295] —
             # filter to printable ASCII, strip spaces/nulls.
             self.publish(f"ch{n}_name/state",
                          state.get("name", "").rstrip("\x00 "),
@@ -918,14 +918,19 @@ class DeviceWorker:
 
     def _publish_input_state(self, n: int, blob: bytes) -> None:
         """Publish input state: a JSON summary + individual MISC field
-        states (mute/polar/delay/volume) extracted from blob[70..77].
+        states (mute/polar/delay/volume) extracted from blob[72..79].
 
         The 288-byte input blob's full layout isn't completely decoded;
         we publish what's known and the raw hex tail for advanced users.
+
+        Offsets updated 2026-04-22 for the parse_frame fix (+2 from the
+        pre-fix values — the 288-byte multi-frame input read had the
+        same first-frame-under-read bug as the 296-byte channel-state
+        read; see ``dsp408/protocol.py::parse_frame`` for the full story).
         """
-        if len(blob) < 96:
+        if len(blob) < 98:
             return
-        misc = blob[70:78]
+        misc = blob[72:80]
         # Per leon source: [feedback, polar, mode, mute, delay_le16, vol, spare]
         feedback = misc[0]
         polar = bool(misc[1])
@@ -933,8 +938,8 @@ class DeviceWorker:
         muted = bool(misc[3])
         delay_samples = misc[4] | (misc[5] << 8)
         volume = misc[6]
-        # Noisegate at blob[86..93]: [threshold, attack, knee, release, config, ..]
-        nz = blob[86:94]
+        # Noisegate at blob[88..95]: [threshold, attack, knee, release, config, ..]
+        nz = blob[88:96]
         # Update the cache so partial-field writes preserve other fields
         cache = self._input_misc_cache(n - 1)
         cache.update(polar=polar, muted=muted, delay=delay_samples, volume=volume)
@@ -955,7 +960,7 @@ class DeviceWorker:
                 "release": nz[3],
                 "config": nz[4],
             },
-            "blob_tail_hex": blob[78:96].hex(),  # for advanced inspection
+            "blob_tail_hex": blob[80:98].hex(),  # for advanced inspection
         }
         self.publish(f"in{n}_state/state", doc, retain=True, qos=1)
         # Polar is the only audibly-functional MISC field in firmware
@@ -999,7 +1004,7 @@ class DeviceWorker:
         delay_samples = int(state.get("delay", 0))
         doc = {
             "polar": bool(state.get("polar", False)),
-            # Raw value of blob[252].  Semantic unknown — leon called this
+            # Raw value of blob[254].  Semantic unknown — leon called this
             # "eq_mode" but the live probe disproved that interpretation
             # (writes round-trip but do NOT bypass EQ).  Exposed under
             # `byte_252` so HA users don't wire automations on a misleading

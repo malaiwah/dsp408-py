@@ -55,7 +55,7 @@ def test_set_channel_gain_persists_across_reopen():
             d.set_channel(4, db=want_db, muted=False)
         with _session() as d:
             blob = d.read_channel_state(4)
-            raw = struct.unpack("<H", blob[248:250])[0]
+            raw = struct.unpack("<H", blob[250:252])[0]
             after_db = (raw - 600) / 10.0
         assert abs(after_db - want_db) < 0.05, (
             f"gain did not persist: wrote {want_db} dB, reopened and "
@@ -73,7 +73,7 @@ def test_set_channel_mute_persists_across_reopen():
             d.set_channel(5, db=0.0, muted=True)
         with _session() as d:
             blob = d.read_channel_state(5)
-            muted = blob[246] == 0   # blob[246]: 1 audible, 0 muted
+            muted = blob[248] == 0   # blob[OFF_MUTE]: 1 audible, 0 muted
         assert muted, "mute state did not persist across reopen"
     finally:
         with _session() as d:
@@ -87,7 +87,7 @@ def test_set_routing_persists_across_reopen():
             d.set_routing(6, in1=True, in2=False, in3=True, in4=False)
         with _session() as d:
             blob = d.read_channel_state(6)
-            routing = list(blob[262:266])
+            routing = list(blob[264:268])
         assert routing == [100, 0, 100, 0], (
             f"routing did not persist: wrote [100, 0, 100, 0], "
             f"read {routing}"
@@ -108,12 +108,12 @@ def test_set_crossover_persists_across_reopen():
             )
         with _session() as d:
             blob = d.read_channel_state(2)
-            hpf_f = struct.unpack("<H", blob[254:256])[0]
-            hpf_filter = blob[256]
-            hpf_slope = blob[257]
-            lpf_f = struct.unpack("<H", blob[258:260])[0]
-            lpf_filter = blob[260]
-            lpf_slope = blob[261]
+            hpf_f = struct.unpack("<H", blob[256:258])[0]
+            hpf_filter = blob[258]
+            hpf_slope = blob[259]
+            lpf_f = struct.unpack("<H", blob[260:262])[0]
+            lpf_filter = blob[262]
+            lpf_slope = blob[263]
         assert (hpf_f, hpf_filter, hpf_slope,
                 lpf_f, lpf_filter, lpf_slope) == \
                (123, 2, 3, 17890, 2, 3), (
@@ -158,7 +158,7 @@ def test_set_channel_name_persists_across_reopen():
             d.set_channel_name(3, want_name)
         with _session() as d:
             blob = d.read_channel_state(3)
-            got_name = blob[286:294].decode("ascii", errors="replace")
+            got_name = blob[288:296].decode("ascii", errors="replace")
         assert got_name == want_name, (
             f"channel name did not persist: wrote {want_name!r}, "
             f"read {got_name!r}"

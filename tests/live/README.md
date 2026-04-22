@@ -45,8 +45,11 @@ device exclusively.
 
 ## What each file covers
 
-- ``test_read_stability.py`` — characterises the firmware's
-  read-divergence quirk and verifies the library's double-read fix.
+- ``test_read_stability.py`` — locks in that reads are byte-exact
+  across repeated calls on every channel.  (Earlier versions
+  characterised a "read-divergence quirk" that turned out to be a
+  parser bug in :func:`dsp408.protocol.parse_frame`; with the bug
+  fixed, reads are fully stable.)
 - ``test_surgical_writes.py`` — every high-level write API touches
   only its target bytes, no cross-channel damage.
 - ``test_sequential_writes.py`` — N sequential writes to the same
@@ -57,7 +60,8 @@ device exclusively.
 - ``test_eq_band_all_positions.py`` — every ``(channel, band)``
   combination is writable (regression for the bogus
   ``set_eq_band(ch>0, band=0)`` report).
-- ``test_full_channel_state_shift.py`` — documents the real
-  ``set_full_channel_state`` quirk: firmware drops 2 bytes of
-  multi-frame WRITE payload, causing a left-shift of the tail.
-  Pad blob[48..49] to match [50..51] to make the loss invisible.
+- ``test_full_channel_state_shift.py`` — channel-isolation +
+  semantic round-trip invariants for ``set_full_channel_state``.
+  Round-trip is now byte-exact; the previously-documented "2-byte
+  firmware drop at offsets 48..49" turned out to be the same parser
+  bug as the read-divergence quirk (and doesn't actually exist).

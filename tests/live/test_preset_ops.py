@@ -84,7 +84,7 @@ def test_save_preset_does_not_wipe_ram_state(dsp):
         dsp.save_preset(TEST_PRESET_NAME)
         time.sleep(1.0)
         blob = dsp.read_channel_state(2)
-        raw = struct.unpack("<H", blob[248:250])[0]
+        raw = struct.unpack("<H", blob[250:252])[0]
         after_db = (raw - 600) / 10.0
         assert abs(after_db - want_db) < 0.05, (
             f"save_preset wiped ch2 gain from {want_db} to {after_db}"

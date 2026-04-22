@@ -445,14 +445,16 @@ def do_read_input_summary(input_n: int) -> str:
     except Exception as e:
         return f"error: {e}"
     blob = bytes(blob)
-    if len(blob) < 96:
+    # Input blob is 288 bytes multi-frame; offsets updated 2026-04-22
+    # for the parse_frame fix (+2 from pre-fix).
+    if len(blob) < 98:
         return f"in{input_n}: short blob ({len(blob)} bytes)"
-    misc = blob[70:78]
+    misc = blob[72:80]
     polar = bool(misc[1])
     muted = bool(misc[3])
     delay = misc[4] | (misc[5] << 8)
     volume = misc[6]
-    nz = blob[86:91]
+    nz = blob[88:93]
     return (f"in{input_n}: muted={muted} polar={polar} "
             f"delay={delay} vol={volume}  noisegate=[t={nz[0]} a={nz[1]} "
             f"k={nz[2]} r={nz[3]} cfg={nz[4]:#04x}]")
@@ -587,7 +589,7 @@ def build_ui() -> gr.Blocks:
                 gr.Markdown(
                     "**Live controls below: Master volume / mute and "
                     "per-channel name** (write at cmd=0x2400+ch, lands at "
-                    "blob[286..293]). Crossover + 10-band EQ sliders are "
+                    "blob[288..295]). Crossover + 10-band EQ sliders are "
                     "still placeholders — use the **Raw Console** tab or "
                     "the MQTT bridge to drive those today."
                 )
