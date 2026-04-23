@@ -153,12 +153,37 @@ class DeviceWorker:
         return f"{self._cfg.discovery_prefix}/device/dsp408_{self.slug}/config"
 
     # ── device handle lifecycle ─────────────────────────────────────
+    #
+    # The handle is OPENED ONCE and held across poll cycles.  Re-opening
+    # triggers a fresh kernel HID init probe which generates legitimate
+    # stalls on the DSP-408 — a peak-load event we don't want to pay on
+    # every poll, especially when the device is on a USBIP-over-WiFi
+    # bridge where the bridge can disconnect under concurrent-URB load.
+    # ``_ensure_device`` only creates a new Device when ``self._dev`` is
+    # None (= after ``_close_device`` was called on error).
+    #
+    # ``Device.open`` reads the enumeration info and will auto-enable
+    # read pacing for devices on the vhci-hcd (USBIP) virtual bus,
+    # spreading out multi-read bursts that otherwise overwhelm the
+    # bridge.  Local-USB devices get zero pacing.
     def _ensure_device(self) -> Device:
         with self._lock:
             if self._dev is None:
                 # Open by stable path so we survive a re-enumeration loop
-                self._dev = Device.open(path=self._info["path"])
-                self._dev.connect()
+                dev = Device.open(path=self._info["path"])
+                try:
+                    dev.connect()
+                except Exception:
+                    # Partial open: close the HID handle so the next
+                    # ensure_device call cleanly re-opens instead of
+                    # returning a zombie Device whose Transport is live
+                    # but whose connect handshake never completed.
+                    try:
+                        dev.close()
+                    except Exception:
+                        pass
+                    raise
+                self._dev = dev
             return self._dev
 
     def _close_device(self) -> None:

@@ -180,13 +180,63 @@ def _build_display_id(info: dict, index: int, serial_counts: dict) -> str:
     return f"dsp408-{_path_hash(path)}"
 
 
+def _is_usbip_bridged_path(path: bytes) -> bool:
+    """Heuristic: is this device on the Linux vhci-hcd virtual USB bus?
+
+    USBIP-attached devices land on a virtual host controller whose bus
+    number is the next free one after the physical USB controllers.  On
+    the setups we've tested (Pi-class hardware with a single real USB
+    controller on bus 1), this reliably gives ``b"2-..."`` paths when
+    ``usbip attach`` has imported a remote device.  Real local devices
+    on the built-in controller report ``b"1-..."``.
+
+    This is a heuristic — machines with multiple real USB controllers
+    might have bus 2 be real — so callers that care can always force
+    pacing via ``Device.open(..., read_pacing_s=...)`` or ignore the
+    auto-detection.
+
+    Returns True if the path looks like it belongs to ``vhci-hcd``.
+    """
+    if not path:
+        return False
+    # hidapi on Linux can return either libusb-style paths (b"1-1.2:1.0")
+    # or hidraw-style ("b/dev/hidraw0").  Only the libusb-style form
+    # carries the bus number; for hidraw paths we conservatively say
+    # "no" and require the caller to opt into pacing explicitly.
+    if not path.startswith(b"2-") and b"/usb2/" not in path:
+        return False
+    # Sanity-check by looking at vhci-hcd's sysfs: if the bus 2 device
+    # has vhci-hcd as its driver, it's a USBIP bridge.  This costs
+    # one file read; skipped if /sys isn't available (non-Linux).
+    try:
+        import os.path
+        vhci_marker = "/sys/bus/usb/devices/usb2/product"
+        if os.path.exists(vhci_marker):
+            with open(vhci_marker) as f:
+                product = f.read().strip()
+            if "vhci" in product.lower() or "usbip" in product.lower():
+                return True
+        # Fall back to the prefix heuristic if /sys is unavailable
+        return True
+    except OSError:
+        return True
+
+
 def enumerate_devices(aliases: dict[str, str] | None = None) -> list[dict]:
     """Return enriched info dicts for every DSP-408 on the bus.
 
     Each entry has: index, vid, pid, path (bytes), serial_number,
-    product_string, manufacturer, display_id, friendly_name.
+    product_string, manufacturer, display_id, friendly_name,
+    is_bridged.
 
-    `friendly_name` is the alias from the user's config (if any matches
+    ``is_bridged`` is True when the device looks like it's been
+    attached via USBIP (``vhci-hcd`` virtual bus) rather than a real
+    local USB port — see :func:`_is_usbip_bridged_path`.  Callers can
+    use this to set ``Device.open(..., read_pacing_s=0.05)``
+    automatically for bridged devices (the default behaviour of
+    ``Device.open()``) while keeping local USB at full speed.
+
+    ``friendly_name`` is the alias from the user's config (if any matches
     the device's serial / display_id / path), otherwise equal to
     display_id. Callers can supply an explicit `aliases` dict (e.g. from
     a `--aliases PATH` CLI flag); if None, the default search paths are
@@ -216,15 +266,17 @@ def enumerate_devices(aliases: dict[str, str] | None = None) -> list[dict]:
 
     out: list[dict] = []
     for idx, d in enumerate(uniq):
+        p = d.get("path") or b""
         info = {
             "index": idx,
             "vid": d.get("vendor_id", VID),
             "pid": d.get("product_id", PID),
-            "path": d.get("path") or b"",
+            "path": p,
             "serial_number": (d.get("serial_number") or "").strip(),
             "product_string": (d.get("product_string") or "").strip(),
             "manufacturer": (d.get("manufacturer_string") or "").strip(),
             "display_id": _build_display_id(d, idx, serial_counts),
+            "is_bridged": _is_usbip_bridged_path(p),
         }
         info["friendly_name"] = friendly_name_for(info, aliases) or info["display_id"]
         out.append(info)
@@ -300,13 +352,42 @@ class Device:
     Gradio UI threads can share one Device.
     """
 
-    def __init__(self, transport: Transport, info: dict | None = None):
+    # Default pacing applied to bridged (USBIP) connections.  50 ms
+    # between USB exchanges converts a dense ~15-op burst (~100 ms) to
+    # a spread ~750 ms, dramatically reducing concurrent URBs in flight
+    # across a USBIP-over-WiFi bridge.  See malaiwah/dsp408-esp32-bridge
+    # investigation 2026-04-23 for the empirical rationale.  Ignored for
+    # local USB (``read_pacing_s=0`` stays the default there).
+    DEFAULT_BRIDGED_PACING_S = 0.05
+
+    # Default settle-after-open delay for bridged connections.  The
+    # Linux kernel's HID init probe fires ~4 USB control transfers on
+    # the device when hidapi opens the hidraw node for the first time.
+    # If our code starts reading parameter state immediately afterward,
+    # the bridge has to multiplex the kernel probe URBs + our reads in
+    # the same ~5-second window — and the ESP32 bridge firmware's Mode B
+    # failure is exactly that concurrent-URB overload.  A 3-second
+    # settle post-open lets the kernel probe drain before any of our
+    # reads hit the wire.  Zero for local USB where the kernel probe
+    # completes in single-digit ms.
+    DEFAULT_BRIDGED_SETTLE_S = 3.0
+
+    def __init__(self, transport: Transport, info: dict | None = None,
+                 *, read_pacing_s: float = 0.0):
         self._t = transport
         self._seq = 0
         self._lock = threading.Lock()
         self._info: DeviceInfo | None = None
         # Enumeration info at open time (path, serial, display_id).
         self._enum_info: dict = info or {}
+        # Minimum seconds between USB exchanges — see
+        # :meth:`_pace_exchange`.  0 = no pacing (default for local USB);
+        # ``Device.open()`` auto-sets this to ``DEFAULT_BRIDGED_PACING_S``
+        # for devices enumerated on the Linux vhci-hcd virtual bus.
+        self._read_pacing_s: float = float(read_pacing_s)
+        # Monotonic timestamp of the last USB exchange; initialized to 0
+        # so the first exchange is never delayed.
+        self._last_exchange_mono: float = 0.0
 
     # ── enumeration / opening ──────────────────────────────────────────
     @staticmethod
@@ -324,6 +405,8 @@ class Device:
         selector: int | str | None = None,
         *,
         path: bytes | None = None,
+        read_pacing_s: float | None = None,
+        settle_s: float | None = None,
     ) -> Device:
         """Open one DSP-408.
 
@@ -331,7 +414,20 @@ class Device:
             selector: None → first found; int → index into enumerate();
                 str → display_id, serial number, or string-encoded path.
             path: explicit hidapi path (bytes); takes precedence over selector.
+            read_pacing_s: minimum seconds between USB exchanges.  None
+                (default) = auto: 0 for local USB, ``DEFAULT_BRIDGED_PACING_S``
+                (50 ms) for devices attached via USBIP (``vhci-hcd`` bus).
+                Pass an explicit float to override the auto-detection.
+            settle_s: seconds to sleep after opening the HID node, before
+                returning the Device.  None (default) = auto:
+                0 for local USB, ``DEFAULT_BRIDGED_SETTLE_S`` (3 s) for
+                USBIP-bridged devices.  Lets the kernel's HID init probe
+                drain before the caller starts reading parameter state
+                — critical for USBIP-over-WiFi bridges where colliding
+                the probe with our read burst tends to overload the
+                bridge firmware's URB queue.
         """
+        import time as _time
         devs = enumerate_devices()
         if path is not None:
             chosen = next((d for d in devs if d["path"] == path), None)
@@ -341,11 +437,25 @@ class Device:
                 chosen = {"path": path, "display_id": f"dsp408-{_path_hash(path)}",
                           "serial_number": "", "product_string": "",
                           "manufacturer": "", "index": -1,
-                          "vid": VID, "pid": PID}
+                          "vid": VID, "pid": PID,
+                          "is_bridged": _is_usbip_bridged_path(path)}
         else:
             chosen = _resolve_selector(selector, devs)
+        is_bridged = bool(chosen.get("is_bridged"))
+        # Resolve read-pacing policy
+        if read_pacing_s is None:
+            pacing = cls.DEFAULT_BRIDGED_PACING_S if is_bridged else 0.0
+        else:
+            pacing = float(read_pacing_s)
+        # Resolve settle-after-open policy
+        if settle_s is None:
+            settle = cls.DEFAULT_BRIDGED_SETTLE_S if is_bridged else 0.0
+        else:
+            settle = float(settle_s)
         hid_conn = HidCompat().open_path(chosen["path"])
-        return cls(Transport(hid_conn), info=chosen)
+        if settle > 0.0:
+            _time.sleep(settle)
+        return cls(Transport(hid_conn), info=chosen, read_pacing_s=pacing)
 
     def close(self) -> None:
         # Acquire the exchange lock so a concurrent _exchange() on another
@@ -415,6 +525,19 @@ class Device:
         """
         if self._t is None:
             raise ProtocolError("device is closed")
+        # Pacing rate-limiter: when ``_read_pacing_s > 0`` (typically set
+        # by Device.open for USBIP-bridged devices), ensure that every
+        # exchange is at least ``_read_pacing_s`` seconds after the last
+        # one.  This spreads the ~23-op poll-cycle burst out over time,
+        # reducing concurrent URBs across the bridge and its
+        # disconnect-storm failure mode.  Idle periods between polls
+        # naturally satisfy the constraint, so single-shot user actions
+        # (toggle a mute from HA) pay zero latency.
+        if self._read_pacing_s > 0.0:
+            import time as _time
+            elapsed = _time.monotonic() - self._last_exchange_mono
+            if elapsed < self._read_pacing_s:
+                _time.sleep(self._read_pacing_s - elapsed)
         with self._lock:
             # WRITES (dir=a1) MUST use seq=0 — the device silently drops
             # writes with non-zero seq on cat=0x04 cmds (per-channel volume,
@@ -440,6 +563,9 @@ class Device:
             else:
                 self._t.send_frames(frames)
             if not expect_reply:
+                # Stamp pacing clock even for fire-and-forget writes so
+                # back-to-back writes still get spaced out.
+                self._last_exchange_mono = time.monotonic()
                 return None
             deadline = time.monotonic() + timeout_ms / 1000.0
             while True:
@@ -457,6 +583,10 @@ class Device:
                     )
                 # Lenient seq match: device sometimes returns seq=0 regardless.
                 if reply.cmd == cmd:
+                    # Stamp pacing clock on the successful exchange so
+                    # the next one gets spaced out from NOW, not from
+                    # when the cmd was sent.
+                    self._last_exchange_mono = time.monotonic()
                     return reply
                 # Stale frame from a previous exchange — skip and retry.
                 continue
