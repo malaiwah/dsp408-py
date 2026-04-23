@@ -571,6 +571,21 @@ CHANNEL_VOL_MIN = 0      # raw = -60 dB
 CHANNEL_VOL_MAX = 600    # raw = 0 dB (unity)
 CHANNEL_VOL_OFFSET = 600  # raw = (dB * 10) + 600
 
+# Per-channel delay constants (samples).
+# The wire encoding accepts a u16 (0..65535) but the firmware silently
+# clamps anything above CHANNEL_DELAY_MAX_SAMPLES — writes of e.g. 504
+# samples appear to round-trip at the WIRE level (the readback shows
+# the requested value at first), but the audio engine plateaus at the
+# clamp.  Verified live: tests/loopback/test_delay_calibration.py.
+# 359 samples = 8.143 ms @ 44.1 kHz (matches the manual's "8.1471 ms /
+# 277 cm" maximum) or 7.479 ms @ 48 kHz.  The buffer is sized in TAPS,
+# not in time.  Callers (and especially the MQTT bridge) should clamp
+# at this value on input rather than silently letting the firmware do
+# it — otherwise HA / users see one value but the audio engine uses
+# another.
+CHANNEL_DELAY_MIN_SAMPLES = 0
+CHANNEL_DELAY_MAX_SAMPLES = 359
+
 # Per-EQ-band gain range. Same encoding as channel volume (raw = dB*10 + 600)
 # but EQ bands are allowed to BOOST as well as cut, so the upper cap is
 # higher than CHANNEL_VOL_MAX. Live-verified at +12 dB / -60 dB only;
@@ -804,6 +819,8 @@ __all__ = [
     "CHANNEL_VOL_MIN",
     "CHANNEL_VOL_MAX",
     "CHANNEL_VOL_OFFSET",
+    "CHANNEL_DELAY_MIN_SAMPLES",
+    "CHANNEL_DELAY_MAX_SAMPLES",
     "EQ_GAIN_RAW_MIN",
     "EQ_GAIN_RAW_MAX",
     "CHANNEL_SUBIDX",

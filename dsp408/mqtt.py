@@ -56,6 +56,7 @@ except ImportError as e:  # pragma: no cover
     ) from e
 
 from . import Device, DeviceNotFound, ProtocolError, enumerate_devices, resolve_selector
+from . import protocol as _proto
 from .protocol import category_hint
 
 log = logging.getLogger("dsp408.mqtt")
@@ -334,8 +335,12 @@ class DeviceWorker:
                 }
                 for n in range(1, 9)
             },
-            # Per-channel delay (samples). Firmware caps at 359 taps.
+            # Per-channel delay (samples). Firmware caps at
+            # protocol.CHANNEL_DELAY_MAX_SAMPLES (= 359) taps.
             # Validated live: tests/loopback/test_delay_calibration.py.
+            # The bridge's _handle_ch_delay also clamps the cmd-side
+            # input at this max so HA never shows a value the device
+            # didn't actually accept.
             **{
                 f"ch{n}_delay": {
                     "p": "number",
@@ -343,8 +348,8 @@ class DeviceWorker:
                     "uniq_id": f"dsp408_{self.slug}_ch{n}_delay",
                     "stat_t": self.t(f"ch{n}_delay/state"),
                     "cmd_t": self.t(f"ch{n}_delay/set"),
-                    "min": 0,
-                    "max": 359,
+                    "min": _proto.CHANNEL_DELAY_MIN_SAMPLES,
+                    "max": _proto.CHANNEL_DELAY_MAX_SAMPLES,
                     "step": 1,
                     "unit_of_meas": "samples",
                     "icon": "mdi:timer-outline",
@@ -731,21 +736,42 @@ class DeviceWorker:
                      "ON" if polar else "OFF", retain=True, qos=1)
 
     def _handle_ch_delay(self, topic: str, text: str) -> None:
+        from .protocol import (
+            CHANNEL_DELAY_MAX_SAMPLES,
+            CHANNEL_DELAY_MIN_SAMPLES,
+        )
         n = int(topic.rsplit("/ch", 1)[1].split("_")[0])
         if not 1 <= n <= 8:
             raise ValueError(f"channel {n} out of range")
         try:
-            samples = int(float(text.strip()))
+            requested = int(float(text.strip()))
         except ValueError as e:
             raise ValueError(f"delay must be an integer, got {text!r}") from e
-        if not 0 <= samples <= 0xFFFF:
-            raise ValueError(f"delay out of u16 range: {samples}")
-        # Preserve volume + mute from the last cached set; the firmware
-        # silently caps anything above 359 taps.
+        if not 0 <= requested <= 0xFFFF:
+            raise ValueError(f"delay out of u16 range: {requested}")
+        # Clamp at the firmware's hard limit so HA / users see the
+        # value the device will ACTUALLY use (not the value they
+        # requested).  Without the clamp, the firmware silently caps at
+        # CHANNEL_DELAY_MAX_SAMPLES (359 taps) but our state echo
+        # echoed the unclamped requested value — leaving HA showing
+        # 504 samples while the audio engine used 359.  See the field
+        # report 2026-04-22 + tests/loopback/test_delay_calibration.py.
+        samples = max(CHANNEL_DELAY_MIN_SAMPLES,
+                      min(CHANNEL_DELAY_MAX_SAMPLES, requested))
+        if samples != requested:
+            log.warning(
+                "%s ch%d delay: requested %d samples capped to firmware "
+                "max %d (= %.2f ms @ 48 kHz)",
+                self.slug, n, requested, samples,
+                samples * 1000.0 / 48000.0,
+            )
+        # Preserve volume + mute from the last cached set.
         dev = self._ensure_device()
         cached = dev.get_channel_cached(n - 1)
         dev.set_channel(n - 1, db=cached["db"], muted=cached["muted"],
                         delay_samples=samples)
+        # Publish the CLAMPED value so HA reflects what the device
+        # actually has, not what was requested.
         self.publish(f"ch{n}_delay/state", str(samples), retain=True, qos=1)
 
     def _handle_ch_name(self, topic: str, text: str) -> None:

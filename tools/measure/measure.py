@@ -118,7 +118,37 @@ def apply_mic_cal(freqs: np.ndarray, spl_db: np.ndarray,
 
 
 def resolve_device(name: str, kind: str) -> int:
+    """Resolve a sounddevice index from a CLI string.
+
+    Tries integer parse FIRST so ``--output-device 2`` always means
+    "device index 2" (instead of "first device whose name contains the
+    digit 2" — which was the old substring-match-only behaviour and
+    silently routed audio to wrong devices like "BenQ BL2710").  Falls
+    back to case-insensitive substring match on the device name when
+    the input isn't a valid integer.
+    """
     devices = sd.query_devices()
+    # Try integer index first
+    try:
+        idx = int(name)
+    except ValueError:
+        idx = None
+    if idx is not None:
+        if not 0 <= idx < len(devices):
+            raise RuntimeError(
+                f"{kind} device index {idx} out of range (0..{len(devices) - 1})"
+            )
+        d = devices[idx]
+        if kind == "input" and d["max_input_channels"] <= 0:
+            raise RuntimeError(
+                f"device {idx} ({d['name']!r}) has no input channels"
+            )
+        if kind == "output" and d["max_output_channels"] <= 0:
+            raise RuntimeError(
+                f"device {idx} ({d['name']!r}) has no output channels"
+            )
+        return idx
+    # Fall back to substring match by name
     for i, d in enumerate(devices):
         if name.lower() in d["name"].lower():
             if kind == "input" and d["max_input_channels"] > 0:

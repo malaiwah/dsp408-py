@@ -262,6 +262,47 @@ def test_handle_ch_delay_preserves_volume_and_mute():
     assert (w.t("ch5_delay/state"), "144") in client.published
 
 
+def test_handle_ch_delay_clamps_above_firmware_max():
+    """Regression for the field report 2026-04-22:
+
+    The firmware silently caps delay at CHANNEL_DELAY_MAX_SAMPLES
+    (= 359 taps).  The bridge used to echo the requested value to
+    ``chN_delay/state`` regardless — leaving HA showing 504 while the
+    audio engine actually used 359.  Now the bridge clamps on input
+    and publishes the CLAMPED value, so HA == device.
+    """
+    from dsp408.protocol import CHANNEL_DELAY_MAX_SAMPLES
+    w, client, fake = _make_worker()
+    fake.cached = {"db": 0.0, "muted": False, "polar": False,
+                   "delay": 0, "subidx": 0x01}
+
+    # Below cap → passes through unchanged
+    w.handle_command(w.t("ch3_delay/set"), b"200")
+    assert ("set_channel", 2, 0.0, False, 200, None) in fake.calls
+    assert (w.t("ch3_delay/state"), "200") in client.published
+
+    # At cap → still passes
+    w.handle_command(w.t("ch3_delay/set"), str(CHANNEL_DELAY_MAX_SAMPLES).encode())
+    assert ("set_channel", 2, 0.0, False, CHANNEL_DELAY_MAX_SAMPLES, None) in fake.calls
+    assert (w.t("ch3_delay/state"), str(CHANNEL_DELAY_MAX_SAMPLES)) in client.published
+
+    # Above cap (504) → clamped to 359; published state echoes 359, NOT 504
+    w.handle_command(w.t("ch3_delay/set"), b"504")
+    # The set_channel call must have used the clamped value
+    assert ("set_channel", 2, 0.0, False, CHANNEL_DELAY_MAX_SAMPLES, None) in fake.calls
+    # And the published state must reflect what the device actually has
+    assert (w.t("ch3_delay/state"), str(CHANNEL_DELAY_MAX_SAMPLES)) in client.published
+    # The unclamped value must NOT appear anywhere in published state
+    published_for_ch3_delay = [
+        payload for topic, payload in client.published
+        if topic == w.t("ch3_delay/state")
+    ]
+    assert "504" not in published_for_ch3_delay, (
+        "bridge must publish the clamped value, not the requested one — "
+        "otherwise HA shows a delay the firmware silently rejected"
+    )
+
+
 def test_handle_route_bool_writes_unity_then_preserves_user_level():
     w, client, fake = _make_worker()
     # First: bool ON from a fresh OFF cell → seeds unity (0x64)
