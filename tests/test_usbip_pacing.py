@@ -124,11 +124,12 @@ def test_device_open_explicit_pacing_overrides_autodetect(monkeypatch):
     }
     monkeypatch.setattr(_dev, "enumerate_devices", lambda: [local_info])
     monkeypatch.setattr(_dev, "HidCompat", _StubHid)
-    # Default: no pacing for local USB
-    d_auto = Device.open(path=b"1-1.2:1.0")
+    # Default: no pacing for local USB.  wake=False because the stub
+    # HID can't actually round-trip a get_info call.
+    d_auto = Device.open(path=b"1-1.2:1.0", wake=False)
     assert d_auto._read_pacing_s == 0.0
     # Explicit override to 0.1s
-    d_override = Device.open(path=b"1-1.2:1.0", read_pacing_s=0.1)
+    d_override = Device.open(path=b"1-1.2:1.0", read_pacing_s=0.1, wake=False)
     assert d_override._read_pacing_s == 0.1
 
 
@@ -146,7 +147,7 @@ def test_device_open_autodetect_pacing_for_bridged(monkeypatch):
     }
     monkeypatch.setattr(_dev, "enumerate_devices", lambda: [bridged_info])
     monkeypatch.setattr(_dev, "HidCompat", _StubHid)
-    d = Device.open(path=b"2-1:1.0", settle_s=0.0)
+    d = Device.open(path=b"2-1:1.0", settle_s=0.0, wake=False)
     assert d._read_pacing_s == Device.DEFAULT_BRIDGED_PACING_S
     assert d._read_pacing_s > 0
 
@@ -166,15 +167,23 @@ def test_device_open_explicit_zero_disables_pacing_on_bridged(monkeypatch):
     }
     monkeypatch.setattr(_dev, "enumerate_devices", lambda: [bridged_info])
     monkeypatch.setattr(_dev, "HidCompat", _StubHid)
-    d = Device.open(path=b"2-1:1.0", read_pacing_s=0.0, settle_s=0.0)
+    d = Device.open(path=b"2-1:1.0", read_pacing_s=0.0, settle_s=0.0, wake=False)
     assert d._read_pacing_s == 0.0
 
 
-def test_device_open_autodetect_settle_for_bridged(monkeypatch):
-    """Bridged devices default to a ~3s settle-after-open delay.
-    Override with settle_s=0.0 for tests to skip the real sleep.
+def test_device_open_default_settle_is_zero():
+    """The default ``DEFAULT_BRIDGED_SETTLE_S`` is now 0 — the kernel-HID
+    URB race is handled by the wake-OUT, not by sleeping.  Settle is
+    kept as an opt-in knob for callers that want extra slack.
     """
-    import time as _time
+    assert Device.DEFAULT_BRIDGED_SETTLE_S == 0.0
+
+
+def test_device_open_explicit_settle_still_works(monkeypatch):
+    """Even though the default is 0, the settle_s=… override still
+    triggers the post-open sleep — for callers that want defensive
+    padding before their first real call.
+    """
     bridged_info = {
         "index": 0,
         "path": b"2-1:1.0",
@@ -188,20 +197,97 @@ def test_device_open_autodetect_settle_for_bridged(monkeypatch):
     monkeypatch.setattr(_dev, "enumerate_devices", lambda: [bridged_info])
     monkeypatch.setattr(_dev, "HidCompat", _StubHid)
     slept = []
-    monkeypatch.setattr(_time, "sleep", lambda s: slept.append(s))
-    # Also patch the module-level time import inside dsp408.device
     import dsp408.device as _d
     orig_sleep = _d.time.sleep
     try:
         _d.time.sleep = lambda s: slept.append(s)
-        # Open with default settle — should sleep DEFAULT_BRIDGED_SETTLE_S
-        Device.open(path=b"2-1:1.0")
+        Device.open(path=b"2-1:1.0", settle_s=0.5, wake=False)
     finally:
         _d.time.sleep = orig_sleep
-    assert any(s == Device.DEFAULT_BRIDGED_SETTLE_S for s in slept), (
-        f"expected a sleep of {Device.DEFAULT_BRIDGED_SETTLE_S}s after "
-        f"bridged open; got sleeps {slept}"
+    assert 0.5 in slept, f"expected explicit settle of 0.5s; got {slept}"
+
+
+# ── wake-OUT (the actual fix for the kernel-HID-URB race) ─────────────
+def test_device_open_calls_wake_by_default(monkeypatch):
+    """Device.open() must call _wake_hid() immediately after open_path()
+    returns, before settle and before returning the Device.  This
+    sends ONE interrupt-OUT (a get_info read) so the kernel HID layer's
+    waiting interrupt-IN URB completes before its ~1s timeout fires
+    and the kernel re-probes the device.  Critical for USBIP-bridged
+    devices; harmless for local.
+    """
+    bridged_info = {
+        "index": 0,
+        "path": b"2-1:1.0",
+        "vid": 0x0483, "pid": 0x5750,
+        "serial_number": "BRIDGED",
+        "product_string": "",
+        "manufacturer": "",
+        "display_id": "BRIDGED",
+        "is_bridged": True,
+    }
+    monkeypatch.setattr(_dev, "enumerate_devices", lambda: [bridged_info])
+    monkeypatch.setattr(_dev, "HidCompat", _StubHid)
+    wake_calls: list[int] = []
+    orig_wake = Device._wake_hid
+
+    def fake_wake(self):
+        wake_calls.append(1)
+        # don't actually try to talk to the stub HID
+    monkeypatch.setattr(Device, "_wake_hid", fake_wake)
+    Device.open(path=b"2-1:1.0")
+    assert len(wake_calls) == 1, (
+        f"expected exactly one wake call on open; got {len(wake_calls)}"
     )
+
+
+def test_device_open_skips_wake_when_disabled(monkeypatch):
+    """``Device.open(wake=False)`` must NOT call _wake_hid()."""
+    bridged_info = {
+        "index": 0,
+        "path": b"2-1:1.0",
+        "vid": 0x0483, "pid": 0x5750,
+        "serial_number": "BRIDGED",
+        "product_string": "",
+        "manufacturer": "",
+        "display_id": "BRIDGED",
+        "is_bridged": True,
+    }
+    monkeypatch.setattr(_dev, "enumerate_devices", lambda: [bridged_info])
+    monkeypatch.setattr(_dev, "HidCompat", _StubHid)
+    wake_calls: list[int] = []
+    monkeypatch.setattr(Device, "_wake_hid", lambda self: wake_calls.append(1))
+    Device.open(path=b"2-1:1.0", wake=False)
+    assert wake_calls == [], (
+        "wake=False must skip _wake_hid; got "
+        f"{len(wake_calls)} call(s)"
+    )
+
+
+def test_wake_swallows_exceptions(monkeypatch):
+    """_wake_hid() must NEVER propagate — if get_info raises, that
+    error should be deferred to the caller's first real call so the
+    open path stays clean.
+    """
+    bridged_info = {
+        "index": 0,
+        "path": b"2-1:1.0",
+        "vid": 0x0483, "pid": 0x5750,
+        "serial_number": "BRIDGED",
+        "product_string": "",
+        "manufacturer": "",
+        "display_id": "BRIDGED",
+        "is_bridged": True,
+    }
+    monkeypatch.setattr(_dev, "enumerate_devices", lambda: [bridged_info])
+    monkeypatch.setattr(_dev, "HidCompat", _StubHid)
+    # Force get_info to blow up
+    def boom(self):
+        raise OSError("simulated read error")
+    monkeypatch.setattr(Device, "get_info", boom)
+    # open() must succeed despite get_info raising during wake
+    d = Device.open(path=b"2-1:1.0")
+    assert d is not None
 
 
 # ── rate-limiter behaviour ──────────────────────────────────────────────

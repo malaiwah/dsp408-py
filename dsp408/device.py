@@ -360,17 +360,25 @@ class Device:
     # local USB (``read_pacing_s=0`` stays the default there).
     DEFAULT_BRIDGED_PACING_S = 0.05
 
-    # Default settle-after-open delay for bridged connections.  The
-    # Linux kernel's HID init probe fires ~4 USB control transfers on
-    # the device when hidapi opens the hidraw node for the first time.
-    # If our code starts reading parameter state immediately afterward,
-    # the bridge has to multiplex the kernel probe URBs + our reads in
-    # the same ~5-second window — and the ESP32 bridge firmware's Mode B
-    # failure is exactly that concurrent-URB overload.  A 3-second
-    # settle post-open lets the kernel probe drain before any of our
-    # reads hit the wire.  Zero for local USB where the kernel probe
-    # completes in single-digit ms.
-    DEFAULT_BRIDGED_SETTLE_S = 3.0
+    # Default settle-after-open delay.  Originally introduced (3 s for
+    # bridged) to "let the kernel HID init probe drain before our
+    # reads start", but ESP32-bridge URB-level instrumentation
+    # (malaiwah/usbipdcpp_esp32 branch diag/silent+urb-ring-data
+    # 2026-04-24) showed the actual race is the OPPOSITE: the kernel
+    # HID layer attaches and submits ONE interrupt-IN URB on EP 0x82
+    # which sits there waiting for data; the DSP-408 only emits
+    # interrupt-IN as REPLIES to interrupt-OUT cmds, so the URB
+    # NAKs forever, the kernel times out at ~1 s, decides the device
+    # is broken, starts re-reading STRING descriptors — and that
+    # re-probe trips the USBIP bridge into DEV_GONE.
+    #
+    # The fix is to send ONE benign OUT immediately after open, which
+    # produces an interrupt-IN reply that satisfies the waiting URB
+    # before the kernel's timeout.  See ``_wake_hid``.  With that in
+    # place ``settle`` is no longer load-bearing — the wake replaces
+    # it.  Defaulting to 0 for both local and bridged; users can pass
+    # ``settle_s=...`` explicitly for defensive padding if they want it.
+    DEFAULT_BRIDGED_SETTLE_S = 0.0
 
     def __init__(self, transport: Transport, info: dict | None = None,
                  *, read_pacing_s: float = 0.0):
@@ -407,6 +415,7 @@ class Device:
         path: bytes | None = None,
         read_pacing_s: float | None = None,
         settle_s: float | None = None,
+        wake: bool = True,
     ) -> Device:
         """Open one DSP-408.
 
@@ -418,14 +427,24 @@ class Device:
                 (default) = auto: 0 for local USB, ``DEFAULT_BRIDGED_PACING_S``
                 (50 ms) for devices attached via USBIP (``vhci-hcd`` bus).
                 Pass an explicit float to override the auto-detection.
-            settle_s: seconds to sleep after opening the HID node, before
-                returning the Device.  None (default) = auto:
-                0 for local USB, ``DEFAULT_BRIDGED_SETTLE_S`` (3 s) for
-                USBIP-bridged devices.  Lets the kernel's HID init probe
-                drain before the caller starts reading parameter state
-                — critical for USBIP-over-WiFi bridges where colliding
-                the probe with our read burst tends to overload the
-                bridge firmware's URB queue.
+            settle_s: seconds to sleep after opening the HID node and
+                doing the wake-OUT, before returning the Device.  Default
+                0 — historically used as defensive padding for USBIP
+                bridges, but the wake-OUT (see ``wake``) is what actually
+                solves the kernel-HID-URB race; settle is no longer
+                load-bearing.  Pass an explicit value if you want extra
+                slack between open and your first call.
+            wake: if True (default), send one benign OUT command (a
+                ``get_info`` read) IMMEDIATELY after the HID handle
+                opens so the kernel HID layer's waiting interrupt-IN URB
+                gets a reply before its ~1 second timeout.  Critical
+                for USBIP-bridged devices: without this the kernel
+                times out, re-probes the device by re-reading STRING
+                descriptors, and that re-probe trips the USBIP bridge
+                into DEV_GONE.  Pass ``wake=False`` only if you have a
+                specific reason — it's a single round-trip and harmless
+                on local USB.  Empirical: malaiwah/usbipdcpp_esp32
+                investigation 2026-04-24.
         """
         import time as _time
         devs = enumerate_devices()
@@ -453,9 +472,52 @@ class Device:
         else:
             settle = float(settle_s)
         hid_conn = HidCompat().open_path(chosen["path"])
+        dev = cls(Transport(hid_conn), info=chosen, read_pacing_s=pacing)
+        # Wake-OUT IMMEDIATELY (within ms of open_path returning) to
+        # complete the kernel HID layer's waiting interrupt-IN URB
+        # before its ~1 s timeout.  Don't sleep first — the timeout
+        # clock is already ticking.
+        if wake:
+            dev._wake_hid()
+        # Optional defensive padding.  Default 0 — the wake handles
+        # the actual race; settle exists for callers that want extra
+        # slack between open and their first real call.
         if settle > 0.0:
             _time.sleep(settle)
-        return cls(Transport(hid_conn), info=chosen, read_pacing_s=pacing)
+        return dev
+
+    def _wake_hid(self) -> None:
+        """Send one benign OUT cmd and read the matching IN reply.
+
+        Called once by :meth:`open` immediately after the HID handle
+        comes back, before any other USB activity.  The point is to
+        produce ONE interrupt-IN packet on EP 0x82, which satisfies
+        the kernel HID layer's first interrupt-IN URB that gets
+        submitted as part of HID-class attach.
+
+        On local USB this is a no-op cost (one ~10 ms round-trip).
+        On USBIP-bridged devices it's load-bearing: without it, the
+        kernel HID URB sits NAKing for ~1 second, the kernel decides
+        the device is broken, re-reads STRING descriptors as a
+        re-probe, and that re-probe trips the bridge firmware (per
+        the ESP32 bridge URB-ring instrumentation 2026-04-24).
+
+        Uses ``get_info`` because it's:
+          * always present on the device (per the protocol),
+          * single-frame in/out (no multi-frame reassembly to worry about),
+          * cheap (~12-byte response identity string),
+          * already covered by the read_raw timeout machinery.
+
+        Failures here are logged at debug level and swallowed — the
+        caller will get a real error on their first actual call if
+        the device is truly unresponsive.
+        """
+        try:
+            self.get_info()
+        except Exception:
+            # Don't propagate; caller's first real call surfaces any
+            # actual problem with a meaningful traceback.
+            pass
 
     def close(self) -> None:
         # Acquire the exchange lock so a concurrent _exchange() on another
