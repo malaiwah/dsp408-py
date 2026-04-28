@@ -37,7 +37,7 @@ Scope note — what's implemented vs. TBD:
       * read_raw() / write_raw() escape hatches
 
     Known unknowns (decode pending — see /tmp/dsp408-re/notes/
-    captures-needed-from-windows.md on the reverse-engineering branch):
+    notes/captures-needed-from-windows.md on the reverse-engineering branch):
       * Live VU meters (cmd=0x13 and idle-poll cmd=0x03 both proved
         static; meter cmd unknown — capture #8 needed)
       * Per-channel name (set / encoding — capture #1 needed)
@@ -90,6 +90,7 @@ from .protocol import (
     DIR_WRITE_ACK,
     EQ_BAND_COUNT,
     EQ_DEFAULT_FREQS_HZ,
+    EQ_GAIN_OFFSET,
     EQ_GAIN_RAW_MAX,
     EQ_GAIN_RAW_MIN,
     EQ_Q_BW_CONSTANT,
@@ -601,11 +602,17 @@ class Device:
             if elapsed < self._read_pacing_s:
                 _time.sleep(self._read_pacing_s - elapsed)
         with self._lock:
-            # WRITES (dir=a1) MUST use seq=0 — the device silently drops
-            # writes with non-zero seq on cat=0x04 cmds (per-channel volume,
-            # routing matrix, EQ). The Windows GUI uses seq=0 for every
-            # write and only increments seq for READ requests. Reads keep
-            # the auto-increment so we can still match late replies to the
+            # WRITES (dir=a1) MUST use seq=0 — applies to ALL write
+            # commands regardless of category.  The Windows GUI uses
+            # seq=0 for every write (cat=0x04 per-channel + cat=0x09
+            # preset/master + multi-frame full-channel-state, all the
+            # same).  Originally observed on cat=0x04 writes (per-
+            # channel volume / routing matrix / EQ) and the comment
+            # used to imply that's the only category affected, but
+            # cat=0x09 writes (preset name, master, save/load preset
+            # trigger) follow the same rule — non-zero seq on a write
+            # gets silently dropped by the firmware.  Reads keep the
+            # auto-increment so we can still match late replies to the
             # correct in-flight request.
             seq = 0 if direction == DIR_WRITE else self._next_seq()
             # Multi-frame WRITE for payloads > 48 bytes (e.g. the
@@ -720,6 +727,18 @@ class Device:
         reply = self.read_raw(cmd=CMD_CONNECT, category=CAT_STATE)
         if not reply.payload:
             raise ProtocolError("CONNECT: empty payload")
+        status = reply.payload[0]
+        if status != 0x00:
+            # Every healthy connect we've ever captured returns 0x00.
+            # Non-zero means the firmware refused or signalled some
+            # error condition — surface it instead of returning the
+            # value silently and letting callers proceed as if all
+            # were well.
+            raise ProtocolError(
+                f"CONNECT returned non-zero status 0x{status:02x} — "
+                f"firmware refused the session-open handshake.  "
+                f"Power-cycle the DSP and retry."
+            )
         if warmup:
             for ch in range(8):
                 try:
@@ -729,7 +748,7 @@ class Device:
                     # the connect — the warmup's job is just to drain
                     # the firmware's startup queue.
                     pass
-        return reply.payload[0]
+        return status
 
     def get_info(self) -> str:
         """Return the device identity string, e.g. `"MYDW-AV1.06"`."""
@@ -1215,16 +1234,30 @@ class Device:
 
         Args:
             polar: True/False to set/clear 180° phase invert; None (default)
-                preserves the cached polar value so callers that don't care
-                about polar don't accidentally flip it.
+                preserves the channel's *current* polar value (read live
+                from the device on first call per channel, then tracked
+                in the per-channel cache).  Without this priming a fresh
+                ``Device.open()`` followed by ``set_channel(ch, db=...,
+                muted=...)`` would silently FLIP a channel that was
+                inverted on the device back to non-inverted, since the
+                cache initialises ``polar=False`` by default.  See the
+                same auto-prime pattern in ``set_channel_mute`` /
+                ``set_channel_volume`` / ``set_channel_polar``.
         """
-        self._channel_cache_init()
+        # Prime the cache from the device whenever ``polar`` isn't
+        # explicitly supplied — otherwise we'd combine the new
+        # gain/mute/delay with stale ``polar=False`` defaults and clobber
+        # the user's configured phase setting.  When ``polar`` IS
+        # explicitly supplied, priming isn't strictly required but is
+        # still useful for the subidx lookup; cheap (no-op once primed).
+        self._prime_channel_cache(channel)
         # Use the discovered subidx (from get_channel readback), falling back
         # to the CHANNEL_SUBIDX table default for channels not yet read or
         # for channels whose subidx is 0x00 (uninitialized firmware struct).
         cached_si = self._channel_cache[channel].get("subidx", 0)
         si = cached_si if cached_si != 0 else CHANNEL_SUBIDX[channel]
-        # Default polar to cached value (preserve unless explicitly changed).
+        # Default polar to cached (now-primed) value when the caller
+        # didn't explicitly pass True/False.
         eff_polar = (self._channel_cache[channel].get("polar", False)
                      if polar is None else bool(polar))
         payload = self._channel_payload(channel, db, muted, delay_samples,
@@ -1440,7 +1473,7 @@ class Device:
         Until then, treat this as "send the canonical bytes the GUI
         sends" — useful for round-tripping, possibly NOT useful as an
         actual factory reset.  See
-        ``captures-needed-from-windows.md`` item #2 on the
+        ``notes/captures-needed-from-windows.md`` item #2 on the
         reverse-engineering branch.
         """
         # Step 1: name to "Custom"
@@ -1485,19 +1518,30 @@ class Device:
     # we never validated that on the wire. Stub kept so the MQTT button
     # has a target; do NOT rely on it.
     def load_factory_preset(self, preset_id: int) -> None:
-        """⚠ KNOWN-BROKEN: intended to load one of the 6 built-in presets.
+        """⚠ NOT IMPLEMENTED — intended to load one of the 6 built-in presets.
 
-        Wire encoding is unverified.  Need a fresh capture (see
-        captures-needed-from-windows.md item #3 on the reverse-engineering
-        branch).
+        The wire encoding is unverified — what's coded below is a
+        leon-decompile guess (``0xB500 | preset_id`` to register
+        0x061F) that we never validated against a Windows-GUI capture.
+        Calling this method will likely either no-op or send a frame
+        that the firmware ignores.  Raises ``NotImplementedError``
+        rather than silently doing nothing useful — the prior
+        behavior was a "best guess write" that returned cleanly,
+        which made it look like it worked from the outside.
+
+        To restore: capture the official GUI's "Load Factory Preset"
+        action (item #3 in the captures-needed list on the
+        reverse-engineering branch), decode the wire format from the
+        capture, replace this body with the verified encoding.
         """
         if not 1 <= preset_id <= 6:
             raise ValueError(f"preset_id must be 1..6, got {preset_id}")
-        # Best guess from the leon decompile — likely wrong; do not rely on it.
-        magic = 0xB500 | preset_id
-        self.write_raw(cmd=0x061F,
-                       data=bytes([magic & 0xFF, (magic >> 8) & 0xFF]),
-                       category=CAT_STATE)
+        raise NotImplementedError(
+            "load_factory_preset wire encoding is unverified — see method "
+            "docstring.  Use load_preset_by_name() with a saved-preset "
+            "slot name instead, or capture the GUI's 'Load Factory Preset' "
+            "action and update this method's body."
+        )
 
     def set_routing(self, output_idx: int,
                     in1: bool, in2: bool, in3: bool, in4: bool) -> None:
@@ -1705,7 +1749,7 @@ class Device:
                     f"bandwidth_byte must be 1..255, got {bandwidth_byte}")
             b4 = bandwidth_byte
         raw = max(EQ_GAIN_RAW_MIN, min(EQ_GAIN_RAW_MAX,
-                                       round(gain_db * 10 + CHANNEL_VOL_OFFSET)))
+                                       round(gain_db * 10 + EQ_GAIN_OFFSET)))
         payload = bytes([
             freq_hz & 0xFF, (freq_hz >> 8) & 0xFF,
             raw & 0xFF, (raw >> 8) & 0xFF,
@@ -1980,9 +2024,8 @@ class Device:
                 raise ValueError(
                     f"bandwidth_byte must be 1..255, got {bandwidth_byte}")
             b4 = bandwidth_byte
-        from .protocol import EQ_GAIN_RAW_MAX, EQ_GAIN_RAW_MIN
         raw = max(EQ_GAIN_RAW_MIN, min(EQ_GAIN_RAW_MAX,
-                                       round(gain_db * 10 + CHANNEL_VOL_OFFSET)))
+                                       round(gain_db * 10 + EQ_GAIN_OFFSET)))
         payload = bytes([
             freq_hz & 0xFF, (freq_hz >> 8) & 0xFF,
             raw & 0xFF, (raw >> 8) & 0xFF,
@@ -2102,9 +2145,23 @@ class Device:
           2. Set preset name to ``name`` (cmd=0x00).
           3. Bulk-write all 8 channels' full state via
              :meth:`set_full_channel_state` (cmd=0x10000..0x10003 then
-             cmd=0x04..0x07 with 296-byte payloads). ← needs multi-frame.
+             cmd=0x04..0x07 with 296-byte payloads).
 
-        Destructive on the chosen slot once functional.
+        ⚠ **Destructive on the chosen flash slot.**  Each call rewrites
+        the flash region tied to ``name``; if you save a corrupted /
+        divergent blob you've burned the slot and recovery requires a
+        manual GUI re-tune.
+
+        Stable-blob guard: each per-channel read is repeated until two
+        consecutive 296-byte blobs agree, with a small attempt budget.
+        Without this guard a transient firmware read-divergence event
+        (the EQ-region ~6% rate documented in
+        ``read_channel_state``) could land a shifted blob in flash.
+        If a channel never converges within the budget, raises
+        ``ProtocolError`` BEFORE writing anything to flash for that
+        channel — the save stops mid-flight rather than poisoning a
+        slot.  Channels written before the divergence WILL have been
+        committed; reload the prior preset via the GUI to recover.
         """
         # Step 1: tell firmware "begin save transaction"
         self.write_raw(cmd=CMD_PRESET_SAVE_TRIGGER,
@@ -2114,11 +2171,31 @@ class Device:
         encoded = name.encode("ascii", errors="ignore")[:15]
         name_payload = encoded + b"\x00" * (15 - len(encoded)) + b"\x00"
         self.write_raw(cmd=CMD_PRESET_NAME, data=name_payload, category=CAT_STATE)
-        # Step 3: dump full channel state for all 8 channels (currently
-        # blocked by multi-frame-write limitation — see set_full_channel_state)
+        # Step 3: dump full channel state for all 8 channels.  For each
+        # channel, read until we get two consecutive byte-identical
+        # blobs — protects against the firmware's ~6% EQ-region
+        # read-divergence quirk poisoning the saved preset.
+        max_attempts = 6
         for ch in range(8):
-            blob = self.read_channel_state(ch)
-            self.set_full_channel_state(ch, bytes(blob))
+            prev: bytes | None = None
+            stable_blob: bytes | None = None
+            for _ in range(max_attempts):
+                blob = bytes(self.read_channel_state(
+                    ch, retry_on_divergence=False))
+                if prev is not None and blob == prev:
+                    stable_blob = blob
+                    break
+                prev = blob
+            if stable_blob is None:
+                raise ProtocolError(
+                    f"save_preset({name!r}): could not get two consecutive "
+                    f"agreeing reads of ch{ch} within {max_attempts} attempts; "
+                    f"refusing to commit a potentially-divergent blob to "
+                    f"flash.  Channels 0..{ch - 1} have already been "
+                    f"committed — reload the prior preset via the Windows "
+                    f"GUI to recover."
+                )
+            self.set_full_channel_state(ch, stable_blob)
 
     def load_preset_by_name(self, name: str) -> None:
         """Load a named preset from internal flash by setting its name.

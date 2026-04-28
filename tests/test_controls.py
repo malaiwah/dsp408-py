@@ -330,6 +330,167 @@ def test_set_channel_mute_auto_primes_cache_from_device() -> None:
     assert payload[0] == 0, "mute flag must be 0 (muted) in the write payload"
 
 
+def test_set_channel_with_polar_None_does_not_silently_flip() -> None:
+    """Regression for the polar-clobber bug:
+
+    On a fresh ``Device.open()`` the per-channel cache is initialised to
+    ``polar=False``.  Calling ``set_channel(ch, db=..., muted=...)``
+    without an explicit ``polar=`` value used to combine the new
+    gain/mute with that ``False`` default and write it back — silently
+    flipping any channel that was inverted on the device back to
+    non-inverted.
+
+    After the fix, ``set_channel`` calls ``_prime_channel_cache`` when
+    ``polar`` is ``None`` so the cached polar reflects the LIVE
+    device state before being baked into the write payload.
+    """
+    from dsp408.protocol import (
+        CMD_READ_CHANNEL_BASE,
+        DIR_RESP,
+        OFF_GAIN,
+        OFF_MUTE,
+        OFF_POLAR,
+        OFF_SPK_TYPE,
+    )
+
+    d, t = _make_device()
+    # Synthesize a "live" blob for ch4 with polar=1 (inverted).
+    blob = bytearray(296)
+    blob[OFF_MUTE] = 1
+    blob[OFF_POLAR] = 1                # ← live-inverted
+    blob[OFF_GAIN] = 0x58               # raw_vol = 0x0258 = 600 → 0 dB
+    blob[OFF_GAIN + 1] = 0x02
+    blob[OFF_SPK_TYPE] = 0x08           # default for ch4
+    synth = Frame(
+        direction=DIR_RESP, seq=0, category=CAT_PARAM,
+        cmd=(CMD_READ_CHANNEL_BASE << 8) | 4,
+        payload_len=len(blob), payload=bytes(blob),
+        checksum=0, checksum_ok=True, raw=b"\x00" * 64,
+    )
+    # Adaptive read may consume up to 6 frames before convergence
+    for _ in range(6):
+        t.queue_reply(synth)
+
+    # Now: set_channel WITHOUT specifying polar.  The fix must read
+    # the live polar=1 from the device and preserve it in the write.
+    d.set_channel(4, db=-3.0, muted=False)
+
+    # Find the channel write
+    parsed = [parse_frame(f) for f in t.sent]
+    writes = [
+        f for f in parsed
+        if f is not None
+        and 0x1F00 <= f.cmd <= 0x1F07
+        and f.direction == DIR_WRITE
+    ]
+    assert len(writes) == 1, (
+        f"expected exactly one channel write; got {len(writes)}"
+    )
+    payload = bytes(writes[0].payload[:8])
+    # payload[1] is the polar byte — MUST be 1 (preserved from live read)
+    assert payload[1] == 1, (
+        f"set_channel(polar=None) silently flipped polar from "
+        f"live=1 to written={payload[1]} — the cache wasn't primed!"
+    )
+
+
+def test_set_channel_with_polar_explicit_overrides_cache() -> None:
+    """Sanity: when ``polar=`` is explicitly passed, the explicit value
+    wins over whatever's in the cache.  This is the documented
+    semantics — the auto-prime only kicks in when polar is None.
+    """
+    d, t = _make_device()
+    # Pre-populate cache as if a previous set_channel ran with polar=True
+    d._channel_cache_init()
+    d._channel_cache[2]["polar"] = True
+    d._channel_cache_primed.add(2)
+    # Explicit polar=False must override the cached True
+    d.set_channel(2, db=0.0, muted=False, polar=False)
+    parsed = [parse_frame(f) for f in t.sent]
+    writes = [
+        f for f in parsed
+        if f is not None and 0x1F00 <= f.cmd <= 0x1F07 and f.direction == DIR_WRITE
+    ]
+    assert len(writes) == 1
+    assert bytes(writes[0].payload[:2])[1] == 0, (
+        "explicit polar=False must win over cached polar=True"
+    )
+
+
+def test_connect_raises_on_non_zero_status() -> None:
+    """``connect()`` returns ``status_byte`` (= reply payload[0]).
+    Healthy connects always return 0x00.  A non-zero status means the
+    firmware refused the handshake — we now raise rather than letting
+    the caller silently proceed with a bad session.
+    """
+    from dsp408.protocol import CMD_CONNECT, CAT_STATE, DIR_RESP
+
+    d, t = _make_device()
+    bad_status = Frame(
+        direction=DIR_RESP, seq=0, category=CAT_STATE,
+        cmd=CMD_CONNECT,
+        payload_len=1, payload=bytes([0x42]),    # non-zero!
+        checksum=0, checksum_ok=True, raw=b"\x00" * 64,
+    )
+    t.queue_reply(bad_status)
+    with pytest.raises(_dsp_protocol_error_class(), match="non-zero status"):
+        d.connect(warmup=False)
+
+
+def _dsp_protocol_error_class():
+    """Lazy import so the test module loads even if device.py is
+    being modified during test development."""
+    from dsp408.device import ProtocolError
+    return ProtocolError
+
+
+def test_connect_returns_zero_on_healthy_handshake() -> None:
+    from dsp408.protocol import CMD_CONNECT, CAT_STATE, DIR_RESP
+
+    d, t = _make_device()
+    healthy = Frame(
+        direction=DIR_RESP, seq=0, category=CAT_STATE,
+        cmd=CMD_CONNECT,
+        payload_len=1, payload=bytes([0x00]),
+        checksum=0, checksum_ok=True, raw=b"\x00" * 64,
+    )
+    t.queue_reply(healthy)
+    status = d.connect(warmup=False)
+    assert status == 0x00
+
+
+def test_eq_gain_offset_is_separate_from_channel_vol_offset() -> None:
+    """Issue #7: EQ encoding should reference its own ``EQ_GAIN_OFFSET``
+    constant, not borrow ``CHANNEL_VOL_OFFSET``.  Their values
+    coincide today (= 600) but the symbols are independent so a future
+    change to per-channel volume scaling won't accidentally desync EQ.
+    """
+    from dsp408 import protocol as p
+    assert hasattr(p, "EQ_GAIN_OFFSET")
+    assert isinstance(p.EQ_GAIN_OFFSET, int)
+    # Documented in __all__
+    assert "EQ_GAIN_OFFSET" in p.__all__
+    # Encoding formula matches the docstring claim
+    # raw = (dB × 10) + EQ_GAIN_OFFSET
+    assert (0.0 * 10 + p.EQ_GAIN_OFFSET) == 600
+    assert (-60.0 * 10 + p.EQ_GAIN_OFFSET) == p.EQ_GAIN_RAW_MIN
+    assert (60.0 * 10 + p.EQ_GAIN_OFFSET) == p.EQ_GAIN_RAW_MAX
+
+
+def test_off_eq_mode_alias_kept_but_not_in_all() -> None:
+    """Issue #4: ``OFF_EQ_MODE`` is a deprecated alias of
+    ``OFF_BYTE_252``; kept on the module for source-compat with existing
+    callers, but excluded from ``__all__`` so new code doesn't auto-
+    import it from ``protocol *``."""
+    from dsp408 import protocol as p
+    # Alias still resolvable
+    assert hasattr(p, "OFF_EQ_MODE")
+    assert p.OFF_EQ_MODE == p.OFF_BYTE_252
+    # Not exported via __all__ anymore
+    assert "OFF_EQ_MODE" not in p.__all__
+    assert "OFF_BYTE_252" in p.__all__   # canonical name kept
+
+
 def test_channel_volume_then_mute_preserves_volume() -> None:
     """set_channel_volume then set_channel_mute should retain the volume.
 
@@ -748,21 +909,32 @@ def test_get_channel_updates_cache_with_discovered_subidx() -> None:
     )
 
 
-def test_load_factory_preset_encodes_preset_id() -> None:
-    """load_factory_preset(n) writes 0xB500 | n to the magic register.
+def test_load_factory_preset_raises_not_implemented_in_range() -> None:
+    """``load_factory_preset`` was historically a leon-decompile guess
+    (``0xB500 | id`` to register 0x061F) that we never verified
+    against a Windows-GUI capture.  It now explicitly raises
+    ``NotImplementedError`` for valid IDs rather than silently
+    sending the unverified frame and returning cleanly — that prior
+    behaviour made it look like the feature worked from the outside
+    when it almost certainly didn't.
 
-    ⚠ Wire encoding still UNVERIFIED — this just guards the leon-decompile
-    derived formula; an actual end-to-end capture is needed to confirm.
+    Restore plan: capture the GUI's "Load Factory Preset" action,
+    decode, replace the body with the verified encoding.
     """
     d, t = _make_device()
-    d.load_factory_preset(3)
-    assert _last_payload(t) == bytes([0x03, 0xB5])  # 0xB503 LE
-    cmd, cat, _dir, _seq = _last_meta(t)
-    assert cmd == 0x061F
-    assert cat == CAT_STATE
+    with pytest.raises(NotImplementedError, match="unverified"):
+        d.load_factory_preset(3)
+    # Critically, no frame should have been sent — the raise happens
+    # BEFORE any wire activity so users don't get a half-write.
+    assert t.sent == [], (
+        f"load_factory_preset must raise WITHOUT touching the wire; "
+        f"sent {len(t.sent)} frame(s)"
+    )
 
 
 def test_load_factory_preset_rejects_out_of_range() -> None:
+    """Range check fires BEFORE the NotImplementedError so callers get
+    the most-specific complaint (``ValueError`` for bad IDs)."""
     d, _ = _make_device()
     with pytest.raises(ValueError):
         d.load_factory_preset(0)

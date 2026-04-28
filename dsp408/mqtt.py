@@ -38,6 +38,32 @@ count would explode); the typed Device methods are reachable from HA
 via the ``raw/write`` cmd topic if needed.
 
 Requires `paho-mqtt` (install with `uv sync --extra mqtt`).
+
+⚠ **Read-divergence — single-shot reads can return bogus data**
+
+The DSP-408 firmware (v1.06) occasionally emits a 2-byte-left-shifted
+variant of the EQ region (offsets 48..245) on the read response —
+roughly once every ~16 reads in steady state, and more frequently
+during cold-start.  The semantic per-channel record (offsets 248..295
+— mute / gain / delay / crossover / routing / compressor / name) is
+unaffected, but anything that diffs raw bytes or reads upper-band EQ
+will see phantom changes.
+
+The library's :meth:`dsp408.device.Device.read_channel_state` defaults
+to ``retry_on_divergence=True`` which re-reads up to 6 times until two
+consecutive blobs agree.  **Every code path in this module that reads
+channel state goes through that default** (typically via
+``Device.get_channel(...)``) — do not pass ``retry_on_divergence=False``
+when adding new reads here unless you've confirmed the caller can
+handle the occasional shifted blob.  An aggressive equivalent of the
+adaptive-retry loop is also documented in the reverse-engineered C++
+client; back-porting the same defensive read everywhere is
+intentional.
+
+If you do see phantom field changes in MQTT state (especially in the
+``ch{n}_state`` JSON's ``raw_blob_hex`` field if you re-enable that),
+suspect a single-shot read got through somewhere — open
+``dsp408/device.py::read_channel_state`` for the full characterisation.
 """
 from __future__ import annotations
 

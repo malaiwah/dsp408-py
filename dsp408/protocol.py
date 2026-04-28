@@ -586,10 +586,15 @@ CHANNEL_VOL_OFFSET = 600  # raw = (dB * 10) + 600
 CHANNEL_DELAY_MIN_SAMPLES = 0
 CHANNEL_DELAY_MAX_SAMPLES = 359
 
-# Per-EQ-band gain range. Same encoding as channel volume (raw = dB*10 + 600)
-# but EQ bands are allowed to BOOST as well as cut, so the upper cap is
-# higher than CHANNEL_VOL_MAX. Live-verified at +12 dB / -60 dB only;
-# the +60 dB ceiling is the protocol envelope, not a calibrated maximum.
+# Per-EQ-band gain encoding.  Same formula as per-channel volume —
+# ``raw = (dB × 10) + EQ_GAIN_OFFSET`` — but EQ bands are allowed to
+# BOOST as well as cut, so the range goes well beyond ``CHANNEL_VOL_MAX``.
+# Kept as its own ``EQ_GAIN_OFFSET`` constant (numerically equal to
+# ``CHANNEL_VOL_OFFSET`` today, both = 600) so a future change to the
+# per-channel volume scheme doesn't accidentally desync EQ encoding.
+# Live-verified at +12 dB / -60 dB only; the +60 dB ceiling is the
+# protocol envelope, not a calibrated maximum.
+EQ_GAIN_OFFSET   = 600    # raw = (dB × 10) + EQ_GAIN_OFFSET
 EQ_GAIN_RAW_MIN  = 0      # = -60 dB
 EQ_GAIN_RAW_MAX  = 1200   # = +60 dB (envelope; only +12 dB verified live)
 
@@ -821,6 +826,7 @@ __all__ = [
     "CHANNEL_VOL_OFFSET",
     "CHANNEL_DELAY_MIN_SAMPLES",
     "CHANNEL_DELAY_MAX_SAMPLES",
+    "EQ_GAIN_OFFSET",
     "EQ_GAIN_RAW_MIN",
     "EQ_GAIN_RAW_MAX",
     "CHANNEL_SUBIDX",
@@ -829,7 +835,10 @@ __all__ = [
     # blob layout
     "BLOB_SIZE",
     "OFF_MUTE", "OFF_POLAR", "OFF_GAIN", "OFF_DELAY",
-    "OFF_BYTE_252", "OFF_EQ_MODE", "OFF_SPK_TYPE",
+    "OFF_BYTE_252", "OFF_SPK_TYPE",
+    # OFF_EQ_MODE is a deprecated alias of OFF_BYTE_252 — kept for
+    # source-compat by callers but excluded from __all__ so new code
+    # imports the canonical name.
     "OFF_HPF_FREQ", "OFF_HPF_FILTER", "OFF_HPF_SLOPE",
     "OFF_LPF_FREQ", "OFF_LPF_FILTER", "OFF_LPF_SLOPE",
     "OFF_MIXER", "MIXER_CELLS",
